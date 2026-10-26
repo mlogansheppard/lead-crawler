@@ -1,4 +1,6 @@
 import asyncio
+import csv
+import io
 import os
 import sys
 
@@ -44,32 +46,112 @@ def test_contact_links():
     assert all("other.com" not in u and "services" not in u for u in links)
 
 
-def test_end_to_end():
-    async def run():
-        site = web.Application()
-        site.router.add_get("/", lambda r: web.Response(text='<a href="/contact-us">Contact</a><a href="https://facebook.com/acmeplumb">fb</a>', content_type="text/html"))
-        site.router.add_get("/contact-us", lambda r: web.Response(text="Call or email hello@127.0.0.1x.com or owner@gmail.com", content_type="text/html"))
-        site_server = TestServer(site)
-        await site_server.start_server()
-        base = f"http://127.0.0.1:{site_server.port}/"
+async def _start_site():
+    async def home(r):
+        return web.Response(text='<a href="/contact-us">Contact</a><a href="https://facebook.com/acmeplumb">fb</a>', content_type="text/html")
 
-        os.environ["API_KEY"] = ""
+    async def contact(r):
+        return web.Response(text="Call or email owner@gmail.com", content_type="text/html")
+    site = web.Application()
+    site.router.add_get("/", home)
+    site.router.add_get("/contact-us", contact)
+    srv = TestServer(site)
+    await srv.start_server()
+    return srv, f"http://127.0.0.1:{srv.port}/"
+
+
+async def _wait(client, job):
+    for _ in range(200):
+        j = await (await client.get(f"/jobs/{job}")).json()
+        if j["status"] != "running":
+            return j
+        await asyncio.sleep(0.05)
+    raise AssertionError("job did not finish")
+
+
+def test_email_job():
+    async def run():
+        site, base = await _start_site()
         client = TestClient(TestServer(server.make_app()))
         await client.start_server()
         r = await client.post("/jobs", json={"sites": [{"id": "123", "url": base}, {"id": "9", "url": "https://yelp.com/biz/x"}]})
-        job = (await r.json())["job_id"]
-        for _ in range(100):
-            j = await (await client.get(f"/jobs/{job}")).json()
-            if j["status"] == "done":
-                break
-            await asyncio.sleep(0.1)
+        j = await _wait(client, (await r.json())["job_id"])
+        out = await (await client.get(f"/jobs/{(await r.json())['job_id']}/csv")).json()
         await client.close()
-        await site_server.close()
-        return j
+        await site.close()
+        return j, out
 
-    j = asyncio.run(run())
-    assert j["status"] == "done" and j["total"] == 2
-    by = {r["id"]: r for r in j["results"]}
-    assert "owner@gmail.com" in by["123"]["emails"], by["123"]
+    j, out = asyncio.run(run())
+    assert j["status"] == "done"
+    by = {r["id"]: r for r in out["results"]}
+    assert by["123"]["emails"] == ["owner@gmail.com"], by["123"]
     assert by["123"]["facebook"] == "https://facebook.com/acmeplumb"
     assert by["9"]["error"] == "skipped"
+
+
+def test_maps_job(monkeypatch):
+    async def run():
+        site, base = await _start_site()
+        posted = []
+
+        async def task_post(r):
+            body = await r.json()
+            posted.extend(body)
+            return web.json_response({"tasks": [{"id": f"t{i}", "status_code": 20100, "cost": 0.0006, "data": {"tag": b["tag"]}} for i, b in enumerate(body)]})
+
+        calls = {"n": 0}
+
+        async def task_get(r):
+            calls["n"] += 1
+            tid = r.match_info["tid"]
+            if calls["n"] == 1:
+                return web.json_response({"tasks": [{"status_code": 40602}]})
+            items = [
+                {"type": "maps_paid_item", "title": "Ad"},
+                {"type": "maps_search", "title": "Acme Plumbing LLC", "cid": "111", "url": base, "phone": "+1 512",
+                 "address": "1 Main St, Austin, TX 78701", "address_info": {"address": "1 Main St", "city": "Austin", "zip": "78701"},
+                 "category": "Plumber", "additional_categories": ["Plumber", "Drainage service"], "rating": {"value": 4.1, "votes_count": 20}},
+            ]
+            if tid == "t1":
+                items.append({"type": "maps_search", "title": "No Site Co", "cid": "222", "address": "", "category": "Plumber"})
+            return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": items}]}]})
+
+        dfs = web.Application()
+        dfs.router.add_post("/task_post", task_post)
+        dfs.router.add_get("/task_get/advanced/{tid}", task_get)
+        dfs_srv = TestServer(dfs)
+        await dfs_srv.start_server()
+        monkeypatch.setattr(server.maps, "DFS_BASE", f"http://127.0.0.1:{dfs_srv.port}")
+        monkeypatch.setattr(server.maps, "DFS_LOGIN", "x")
+        monkeypatch.setattr(server.maps, "POLL_SECONDS", 0)
+        monkeypatch.setattr(server.maps.asyncio, "sleep", _fast_sleep)
+
+        client = TestClient(TestServer(server.make_app()))
+        await client.start_server()
+        r = await client.post("/maps-jobs", json={"tasks": [{"city": "Austin 78701", "category": "plumber", "state_code": "TX"},
+                                                            {"city": "Round Rock 78664", "category": "plumber", "state_code": "TX"}]})
+        jid = (await r.json())["job_id"]
+        j = await _wait(client, jid)
+        text = await (await client.get(f"/jobs/{jid}/csv")).text()
+        await client.close()
+        await site.close()
+        await dfs_srv.close()
+        return posted, j, text
+
+    posted, j, text = asyncio.run(run())
+    assert posted[0]["keyword"] == "plumber in Austin, TX 78701" and posted[0]["depth"] == 200
+    assert j["status"] == "done", j
+    rows = list(csv.DictReader(io.StringIO(text)))
+    assert len(rows) == 2  # deduped by CID, ad skipped
+    acme = [r for r in rows if r["CID"] == "111"][0]
+    assert acme["EMAIL"] == "owner@gmail.com" and acme["STATE CODE"] == "TX"
+    assert acme["URL"] == "https://maps.google.com/?cid=111"
+    assert acme["CATEGORY"] == "Plumber, Drainage service"
+    assert j["stats"]["maps"]["ads_skipped"] == 2
+
+
+_real_sleep = asyncio.sleep
+
+
+async def _fast_sleep(_s):
+    await _real_sleep(0)

@@ -7,6 +7,8 @@ services:
       - "8088:8088"
     environment:
       - API_KEY=${API_KEY}
+      - DFS_LOGIN=${DFS_LOGIN}
+      - DFS_PASSWORD=${DFS_PASSWORD}
       - CONCURRENCY=80
       - PAGE_TIMEOUT=12
       - SITE_BUDGET=45
