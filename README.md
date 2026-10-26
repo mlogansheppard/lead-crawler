@@ -13,7 +13,7 @@ git clone https://github.com/mlogansheppard/lead-crawler.git /opt/lead-crawler
 cd /opt/lead-crawler
 cp .env.example .env && nano .env      # fill in API_KEY, DFS_LOGIN, DFS_PASSWORD
 docker compose up -d --build
-curl -s localhost:8088/health
+curl -s 172.17.0.1:8088/health
 ```
 
 Update later: `cd /opt/lead-crawler && git pull && docker compose up -d --build`
