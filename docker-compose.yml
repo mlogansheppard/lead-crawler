@@ -1,0 +1,17 @@
+services:
+  lead-crawler:
+    build: .
+    container_name: lead-crawler
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    environment:
+      - API_KEY=${API_KEY}
+      - CONCURRENCY=80
+      - PAGE_TIMEOUT=12
+      - SITE_BUDGET=45
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/health')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
