@@ -624,3 +624,14 @@ def test_retry_pass_and_free_recrawl(monkeypatch, tmp_path):
     assert reviews_posted == ["a", "b"]   # a reviewed once in the first run, b only after the re-crawl
     assert len(list(csv.DictReader(io.StringIO(rtext)))) == 2
     assert j["stats"]["reviews"]["cost_total"] == 0.003
+
+
+def test_one_star_inferred_from_average():
+    from app.maps import _one_star
+    assert _one_star({"rating": {"value": 5.0, "votes_count": 30}}) == 0
+    assert _one_star({"rating": {"value": 5.0, "votes_count": 40}}) == ""
+    assert _one_star({"rating": {"value": 4.9, "votes_count": 15}}) == 0
+    assert _one_star({"rating": {"value": 4.9, "votes_count": 25}}) == ""
+    assert _one_star({"rating": {"value": 4.2, "votes_count": 5}}) == ""
+    assert _one_star({"rating": {"votes_count": 0}}) == 0
+    assert _one_star({"rating": {"value": 5.0, "votes_count": 300}, "rating_distribution": {"1": 2}}) == 2

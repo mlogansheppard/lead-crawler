@@ -39,6 +39,20 @@ def _one_star(item):
             return int(dist.get("1") or 0)
         except (TypeError, ValueError):
             return ""
+    # No distribution from the Maps search: work it out from the average when the math rules a 1-star out.
+    # One 1-star among n reviews caps the average at 5 - 4/n. The shown rating is rounded, so leave 0.1 of slack.
+    rating = item.get("rating") or {}
+    if rating.get("votes_count") is None:
+        return ""
+    try:
+        n = int(rating.get("votes_count"))
+        value = float(rating.get("value")) if rating.get("value") is not None else None
+    except (TypeError, ValueError):
+        return ""
+    if n == 0:
+        return 0
+    if value is not None and value - 0.1 > 5 - 4 / n:
+        return 0
     return ""  # unknown
 
 
