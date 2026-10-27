@@ -168,23 +168,42 @@ def _jsonld_emails(raw: str):
 
 def _decode_escapes(raw: str) -> str:
     return (raw.replace("\\u0040", "@").replace("\\x40", "@").replace("%40", "@").replace("&#64;", "@")
-               .replace("&#x40;", "@").replace("\\u002e", ".").replace("\\/", "/"))
+               .replace("&#x40;", "@").replace("&commat;", "@").replace("\\u002e", ".").replace("\\/", "/"))
+
+
+OBF_HINT_RE = re.compile(r"[\[({]\s*at\s*[\])}]|\sdot\s", re.I)
+MAX_AT_SIGNS = 4000
 
 
 def extract_emails(raw_html: str) -> list:
-    found = []
-    found += [m for m in MAILTO_RE.findall(raw_html)]
-    found += [decode_cfemail(h) for h in CFEMAIL_RE.findall(raw_html)]
-    found += [decode_cfemail(h) for h in CF_HREF_RE.findall(raw_html)]
-    found += _jsonld_emails(raw_html)
-    text = html.unescape(TAG_RE.sub(" ", SCRIPT_STYLE_RE.sub(" ", raw_html)))
-    found += EMAIL_RE.findall(text)
-    found += ["{}@{}.{}".format(*m) for m in OBFUSCATED_RE.findall(text)]
-    found += ["{}@{}".format(*m) for m in SPACED_AT_RE.findall(text)]
-    # site builders often put the contact email only inside script/JSON data
-    decoded = html.unescape(_decode_escapes(raw_html[:1_500_000]))
-    found += [m for m in MAILTO_RE.findall(decoded)]
-    found += EMAIL_RE.findall(decoded)
+    """Every email needs an "@", so instead of cleaning and searching the whole page (slow on 2 MB pages),
+    jump to each "@" and only look at the text around it. Covers visible text, mailto links, and emails
+    hidden in script/JSON data (Wix, GoDaddy, Squarespace) after decoding \\u0040, %40, &#64; etc."""
+    decoded = _decode_escapes(raw_html)
+    found = list(MAILTO_RE.findall(decoded))
+    if "cfemail" in raw_html:
+        found += [decode_cfemail(h) for h in CFEMAIL_RE.findall(raw_html)]
+    if "email-protection#" in raw_html:
+        found += [decode_cfemail(h) for h in CF_HREF_RE.findall(raw_html)]
+    if "ld+json" in raw_html:
+        found += _jsonld_emails(raw_html)
+
+    i, n, last_end = decoded.find("@"), 0, -1
+    while i != -1 and n < MAX_AT_SIGNS:
+        n += 1
+        if i >= last_end:  # skip "@" signs already inside the previous window
+            lo, hi = max(0, i - 90), i + 140
+            w = html.unescape(TAG_RE.sub(" ", decoded[lo:hi]))
+            found += EMAIL_RE.findall(w)
+            found += ["{}@{}".format(*m) for m in SPACED_AT_RE.findall(w)]
+            last_end = i + 60
+        i = decoded.find("@", i + 1)
+
+    # "bob [at] gmail [dot] com" style: only pay for the full-text pass when the page hints at it
+    if OBF_HINT_RE.search(decoded):
+        text = html.unescape(TAG_RE.sub(" ", SCRIPT_STYLE_RE.sub(" ", decoded)))
+        found += ["{}@{}.{}".format(*m) for m in OBFUSCATED_RE.findall(text)]
+
     seen, out = set(), []
     for e in found:
         e = clean_email(e.split("?")[0])

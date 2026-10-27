@@ -10,7 +10,7 @@ services:
       - API_KEY=${API_KEY}
       - DFS_LOGIN=${DFS_LOGIN}
       - DFS_PASSWORD=${DFS_PASSWORD}
-      - CONCURRENCY=80
+      - CONCURRENCY=150
       - PAGE_TIMEOUT=12
       - SITE_BUDGET=45
       - DATA_DIR=/data
