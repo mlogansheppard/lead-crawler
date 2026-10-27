@@ -457,10 +457,22 @@ async def guard(job, runner):
 
 
 RUNNING = set()
+# How many maps jobs run at the same time. Extra jobs (e.g. 10 sheet rows added at once) wait as "queued"
+# and start automatically, oldest first, so the VPS never has to hold 10 big crawls in memory at once.
+MAX_ACTIVE_JOBS = int(os.environ.get("MAX_ACTIVE_JOBS", "2"))
+
+
+def _active_maps():
+    return [j for j in JOBS.values() if j["id"] in RUNNING and j["kind"] == "maps"]
 
 
 def start(job):
     if job["id"] in RUNNING:
+        return
+    if job["kind"] == "maps" and len(_active_maps()) >= MAX_ACTIVE_JOBS:
+        if job["status"] != "queued":
+            job["status"], job["phase"] = "queued", "queued"
+            save_job(job, force=True)
         return
     RUNNING.add(job["id"])
     runner = run_maps_job if job["kind"] == "maps" else run_email_job
@@ -470,7 +482,15 @@ def start(job):
             await guard(job, runner)
         finally:
             RUNNING.discard(job["id"])
+            start_next()
     asyncio.get_running_loop().create_task(go())
+
+
+def start_next():
+    for j in sorted((j for j in JOBS.values() if j["status"] == "queued"), key=lambda j: j["created_at"]):
+        if len(_active_maps()) >= MAX_ACTIVE_JOBS:
+            return
+        start(j)
 
 
 # ---------------------------------------------------------------- http
@@ -542,6 +562,9 @@ def get_job_or_404(request):
 
 def _progress(job, stats):
     ph = job.get("phase")
+    if job.get("status") == "queued":
+        ahead = sum(1 for j in JOBS.values() if j["status"] == "queued" and j["created_at"] < job["created_at"])
+        return f"queued behind {len(_active_maps())} running job(s)" + (f" and {ahead} queued" if ahead else "")
     if ph == "maps" and "maps" in stats:
         m = stats["maps"]
         if m.get("strategy") == "adaptive":
@@ -646,7 +669,9 @@ async def locations(request):
 
 async def health(_):
     paused = [j["id"] for j in JOBS.values() if j["status"] == "paused"]
-    return web.json_response({"ok": True, "jobs": len(JOBS), "running": len(RUNNING), "paused": paused,
+    queued = [j["id"] for j in JOBS.values() if j["status"] == "queued"]
+    return web.json_response({"ok": True, "jobs": len(JOBS), "running": len(RUNNING), "paused": paused, "queued": queued,
+                              "max_active_jobs": MAX_ACTIVE_JOBS,
                               "dfs_configured": bool(maps.DFS_LOGIN)})
 
 
@@ -655,8 +680,10 @@ async def background(app):
     Then every RESUME_EVERY seconds retry paused jobs (e.g. after a DataForSEO top-up) and clean up old ones."""
     asyncio.get_running_loop().set_default_executor(DNS_POOL)
     load_jobs()
-    for j in list(JOBS.values()):
-        if j["kind"] == "maps" and j["status"] in ("running", "paused"):
+    for j in sorted(JOBS.values(), key=lambda j: j["created_at"]):
+        if j["kind"] == "maps" and j["status"] in ("running", "paused", "queued"):
+            if j["status"] == "running":
+                j["status"] = "queued"  # interrupted by a restart: re-queue, keeping its saved progress
             start(j)
 
     async def loop():
@@ -672,6 +699,7 @@ async def background(app):
                         os.remove(job_path(j["id"]))
                     except OSError:
                         pass
+            start_next()
     task = asyncio.get_running_loop().create_task(loop())
     yield
     task.cancel()

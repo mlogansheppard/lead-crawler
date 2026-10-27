@@ -15,9 +15,14 @@ services:
       - SITE_BUDGET=45
       - DATA_DIR=/data
       - RESUME_EVERY_SECONDS=600
+      # extra jobs wait in a queue; raise on a bigger VPS
+      - MAX_ACTIVE_JOBS=2
     volumes:
       # saved job progress, so a paused or restarted job picks up where it left off
       - ./data:/data
+    # hard memory cap so the crawler can never starve n8n; if it is ever hit, the container restarts
+    # and the job carries on from its saved progress
+    mem_limit: 1500m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/health')"]
       interval: 60s

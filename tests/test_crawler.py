@@ -478,3 +478,56 @@ def test_job_cleanup_fixes_old_results(monkeypatch):
                                   "types": ["role", "role", "other"], "facebook": ""}}
     asyncio.run(server.clean_job_emails(done))
     assert done["oramedicalspa.com"]["emails"] == ["info@oramedicalspa.com"] and done["oramedicalspa.com"]["types"] == ["role"]
+
+
+def test_queue_limits_parallel_jobs(monkeypatch, tmp_path):
+    """5 sheet rows at once: only MAX_ACTIVE_JOBS run, the rest queue and start by themselves."""
+    async def run():
+        site, base = await _start_site()
+        gate = asyncio.Event()
+        seen_running = []
+
+        async def task_post(r):
+            body = await r.json()
+            return web.json_response({"tasks": [{"id": b["keyword"], "status_code": 20100} for b in body]})
+
+        async def task_get(r):
+            await gate.wait()
+            return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": []}]}]})
+
+        dfs = web.Application()
+        dfs.router.add_post("/task_post", task_post)
+        dfs.router.add_get("/task_get/advanced/{tid}", task_get)
+        dfs_srv = TestServer(dfs)
+        await dfs_srv.start_server()
+        monkeypatch.setattr(server.maps, "DFS_BASE", f"http://127.0.0.1:{dfs_srv.port}")
+        monkeypatch.setattr(server.maps, "DFS_LOGIN", "x")
+        monkeypatch.setattr(server.maps, "POLL_SECONDS", 0)
+        monkeypatch.setattr(server.maps.asyncio, "sleep", _fast_sleep)
+        monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(server, "MAX_ACTIVE_JOBS", 2)
+        server.JOBS.clear()
+        client = TestClient(TestServer(server.make_app()))
+        await client.start_server()
+        ids = []
+        for cat in ["a", "b", "c", "d", "e"]:
+            r = await client.post("/maps-jobs", json={"tasks": [{"city": "Austin 78701", "category": cat, "state_code": "TX"}],
+                                                      "reviews": {"enabled": False}})
+            ids.append((await r.json())["job_id"])
+        await asyncio.sleep(0.05)
+        st = [(await (await client.get(f"/jobs/{i}")).json())["status"] for i in ids]
+        seen_running.append(st)
+        gate.set()
+        for i in ids:
+            for _ in range(200):
+                if (await (await client.get(f"/jobs/{i}")).json())["status"] == "done":
+                    break
+                await asyncio.sleep(0.02)
+        final = [(await (await client.get(f"/jobs/{i}")).json())["status"] for i in ids]
+        await client.close()
+        await site.close()
+        await dfs_srv.close()
+        return seen_running[0], final
+    first, final = asyncio.run(run())
+    assert first.count("running") == 2 and first.count("queued") == 3, first
+    assert final == ["done"] * 5, final
