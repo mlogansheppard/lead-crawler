@@ -727,3 +727,50 @@ def test_one_review_lookup_per_business():
     cids, skipped = server.pick_review_cids(rows, {"f"}, lambda r: True)
     # c is the lowest-rated listing with x@chain.com, so a and b (same email) are skipped; e shares f's website
     assert cids == ["c", "d"] and skipped == 3
+
+
+def test_export_endpoints_end_to_end(monkeypatch, tmp_path):
+    """n8n's new flow: summary -> mv.csv -> MillionVerifier results -> names -> build -> download files."""
+    monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+    base = {c: "" for c in server.maps.slim({}, "").keys()}
+    rows = [
+        {**base, "NAME": "ACME SPA LLC", "CID": "1", "STATE CODE": "NJ", "ADDRESS": "1 Main", "EMAIL": "a@acme.com, b@acme.com", "EMAIL TYPES": "personal, role"},
+        {**base, "NAME": "Glow", "CID": "2", "STATE CODE": "NJ", "EMAIL": "hi@glow.com", "EMAIL TYPES": "role"},
+        {**base, "NAME": "Quiet", "CID": "3", "STATE CODE": "NJ", "EMAIL": "", "FACEBOOK": "https://facebook.com/q"},
+        {**base, "NAME": "Far Away", "CID": "4", "STATE CODE": "TX", "EMAIL": "x@far.com"},
+    ]
+    reviews = [{"CID": "1", "SCORE": 1, "TEXT": "bad, really", "PICTURES": "", "USER NAME": "Bo"},
+               {"CID": "2", "SCORE": 2, "TEXT": "", "PICTURES": "", "USER NAME": ""}]
+    job = {"id": "j1", "kind": "maps", "status": "done", "params": {"states": ["NJ"], "reviews": {"keep": 5}},
+           "rows": rows, "reviews": reviews, "created_at": 0}
+    server.JOBS.clear()
+    server.JOBS["j1"] = job
+
+    async def run():
+        client = TestClient(TestServer(server.make_app()))
+        await client.start_server()
+        h = {"X-API-Key": server.API_KEY} if getattr(server, "API_KEY", "") else {}
+        summ = await (await client.get("/jobs/j1/export/summary", headers=h)).json()
+        mv_csv = await (await client.get("/jobs/j1/export/mv.csv", headers=h)).text()
+        early = await client.post("/jobs/j1/export/build", json={}, headers=h)
+        mvres = "email,quality,result\na@acme.com,good,ok\nb@acme.com,bad,invalid\n"
+        names = await (await client.post("/jobs/j1/export/mv-results", data=mvres.encode(), headers=h)).json()
+        built = await (await client.post("/jobs/j1/export/build", headers=h, json={
+            "names": {"ACME SPA LLC": "Acme Spa"}, "base": "medspa - G5", "ts": "10-26", "keep_results": ["ok", "catch_all"]})).json()
+        files = {}
+        for f in built["files"]:
+            files[f["fileName"]] = await (await client.get(f["path"], headers=h)).text()
+        await client.close()
+        return summ, mv_csv, early.status, names, built, files
+    summ, mv_csv, early_status, names, built, files = asyncio.run(run())
+    assert summ["mv_emails"] == 2 and summ["transform"]["droppedOutOfGroup"] == 1
+    assert mv_csv.split() == ["EMAIL", "a@acme.com", "b@acme.com"]
+    assert early_status == 409  # build before MillionVerifier results is refused
+    assert names["names"] == ["ACME SPA LLC", "Glow"] and names["mv_counts"] == {"ok": 1, "invalid": 1}
+    assert [f["fileName"] for f in built["files"]] == [
+        "medspa - G5 - FB no Email 10-26.csv", "medspa - G5 - No Email 10-26.csv",
+        "medspa - G5 - wReview 10-26.csv", "medspa - G5 - LowScoreNoText 10-26.csv"]
+    w = list(csv.DictReader(io.StringIO(files["medspa - G5 - wReview 10-26.csv"].lstrip("﻿"))))
+    assert [(r["EMAIL"], r["COMPANY NAME"], r["MV RESULT"], r["TEXT"]) for r in w] == [("a@acme.com", "Acme Spa", "ok", "bad, really")]
+    lo = list(csv.DictReader(io.StringIO(files["medspa - G5 - LowScoreNoText 10-26.csv"].lstrip("﻿"))))
+    assert [(r["EMAIL"], r["SCORE"], r["MV RESULT"]) for r in lo] == [("hi@glow.com", "2", "not_verified")]

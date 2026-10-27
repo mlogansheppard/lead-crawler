@@ -34,6 +34,7 @@ import io
 import json
 import os
 import re
+import shutil
 import time
 import traceback
 import uuid
@@ -46,6 +47,7 @@ from extract import (FREE_PROVIDERS, GUESSED_PATHS, contact_links, extract_email
                      rank_emails_typed, registrable, sitemap_links)
 import mxcheck
 import maps
+import export as exporter
 
 API_KEY = os.environ.get("API_KEY", "")
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "80"))
@@ -794,6 +796,130 @@ async def job_output(request):
                         headers={"Content-Disposition": f"attachment; filename={'reviews' if want_reviews else 'maps'}.csv"})
 
 
+# ---------------------------------------------------------------- final files (built here, not in n8n)
+# n8n used to download the whole list and merge it in Code nodes, which runs n8n out of memory on full-state
+# scrapes. Now n8n only moves the small pieces: the emails to verify, MillionVerifier's results, the business
+# names to clean, and the finished files.
+
+def _export_base(job):
+    p = job["params"]
+    codes = [str(c).upper() for c in p.get("states") or []]
+    names = [k for k, v in STATE_NAMES.items() if v in set(codes)]
+    fb_no, no, withe, tstats = exporter.transform(job.get("rows", []), codes, names)
+    keep = int((p.get("reviews") or {}).get("keep") or 5)
+    merged, mstats = exporter.merge(withe, job.get("reviews", []), keep)
+    return fb_no, no, merged, {"transform": tstats, "merge": mstats}
+
+
+def _done_job(request):
+    job, err = get_job_or_404(request)
+    if err:
+        return None, err
+    if job["kind"] != "maps" or job["status"] != "done":
+        return None, web.json_response({"error": "job not finished", "status": job["status"]}, status=409)
+    return job, None
+
+
+async def export_summary(request):
+    if not authed(request):
+        return deny()
+    job, err = _done_job(request)
+    if err:
+        return err
+    _, _, merged, st = await asyncio.get_running_loop().run_in_executor(SCAN_POOL, _export_base, job)
+    return web.json_response({"mv_emails": len(exporter.mv_emails(merged)), "rows": len(merged), **st})
+
+
+async def export_mv_csv(request):
+    if not authed(request):
+        return deny()
+    job, err = _done_job(request)
+    if err:
+        return err
+    _, _, merged, _ = await asyncio.get_running_loop().run_in_executor(SCAN_POOL, _export_base, job)
+    text = "EMAIL\n" + "\n".join(exporter.mv_emails(merged)) + "\n"
+    return web.Response(text=text, content_type="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename={job['id']}-mv.csv"})
+
+
+async def export_mv_results(request):
+    """Body: MillionVerifier's result CSV (raw), or ?skip=1 when there was nothing to verify.
+    Returns the business names n8n should clean with AI."""
+    if not authed(request):
+        return deny()
+    job, err = _done_job(request)
+    if err:
+        return err
+    skipped = request.query.get("skip") in ("1", "true")
+    mv = {} if skipped else exporter.parse_mv_csv((await request.read()).decode("utf-8", errors="replace"))
+    if not skipped and not mv:
+        return web.json_response({"error": "MillionVerifier results had no rows"}, status=400)
+    job["mv_results"], job["mv_skipped"] = mv, skipped
+    save_job(job, force=True)
+    keep = request.query.get("keep", "ok,catch_all").split(",")
+
+    def work():
+        _, _, merged, _ = _export_base(job)
+        rows, counts = exporter.apply_mv(merged, mv, keep, skipped)
+        return exporter.names_to_clean(rows), counts, len(rows)
+    names, counts, n = await asyncio.get_running_loop().run_in_executor(SCAN_POOL, work)
+    return web.json_response({"names": names, "mv_counts": counts, "rows_after_mv": n})
+
+
+def _export_dir(job_id):
+    return os.path.join(DATA_DIR, "exports", job_id)
+
+
+async def export_build(request):
+    """Body: {"names": {original: cleaned}, "base": "medspa - G5", "ts": "10-26", "keep_results": [...]}.
+    Writes the final CSVs and returns their names and download paths."""
+    if not authed(request):
+        return deny()
+    job, err = _done_job(request)
+    if err:
+        return err
+    body = await request.json()
+    if "mv_results" not in job:
+        return web.json_response({"error": "send MillionVerifier results first"}, status=409)
+    base, ts = str(body.get("base") or job["params"].get("label") or job["id"]), str(body.get("ts") or "")
+    keep = body.get("keep_results") or ["ok", "catch_all"]
+    names = body.get("names") or {}
+
+    def work():
+        fb_no, no, merged, st = _export_base(job)
+        rows, counts = exporter.apply_mv(merged, job["mv_results"], keep, job.get("mv_skipped", False))
+        files = exporter.final_files(fb_no, no, rows, names, base, ts)
+        d = _export_dir(job["id"])
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(d):
+            os.remove(os.path.join(d, f))
+        out = []
+        for i, (name, n, text) in enumerate(files):
+            fn = f"{i}.csv"
+            with open(os.path.join(d, fn), "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+            out.append({"fileName": name, "rows": n, "path": f"/jobs/{job['id']}/export/files/{fn}"})
+        return out, counts, st
+    files, counts, st = await asyncio.get_running_loop().run_in_executor(SCAN_POOL, work)
+    return web.json_response({"files": files, "mv_counts": counts, **st})
+
+
+async def export_file(request):
+    if not authed(request):
+        return deny()
+    fn = request.match_info["fn"]
+    if not re.fullmatch(r"\d+\.csv", fn):
+        return web.json_response({"error": "bad file"}, status=400)
+    path = os.path.join(_export_dir(request.match_info["job_id"]), fn)
+    if not os.path.exists(path):
+        return web.json_response({"error": "no such file"}, status=404)
+    def read():
+        with open(path, "rb") as fh:
+            return fh.read()
+    body = await asyncio.get_running_loop().run_in_executor(SCAN_POOL, read)
+    return web.Response(body=body, content_type="text/csv", charset="utf-8")
+
+
 STATE_NAMES = {
     "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA", "Colorado": "CO",
     "Connecticut": "CT", "Delaware": "DE", "District of Columbia": "DC", "Florida": "FL", "Georgia": "GA",
@@ -859,6 +985,7 @@ async def background(app):
                         os.remove(job_path(j["id"]))
                     except OSError:
                         pass
+                    shutil.rmtree(_export_dir(j["id"]), ignore_errors=True)
             start_next()
     task = asyncio.get_running_loop().create_task(loop())
     yield
@@ -874,6 +1001,11 @@ def make_app():
     app.router.add_post("/jobs/{job_id}/recrawl", recrawl_job)
     app.router.add_get("/jobs/{job_id}/csv", job_output)
     app.router.add_get("/jobs/{job_id}/{what:reviews}.csv", job_output)
+    app.router.add_get("/jobs/{job_id}/export/summary", export_summary)
+    app.router.add_get("/jobs/{job_id}/export/mv.csv", export_mv_csv)
+    app.router.add_post("/jobs/{job_id}/export/mv-results", export_mv_results)
+    app.router.add_post("/jobs/{job_id}/export/build", export_build)
+    app.router.add_get("/jobs/{job_id}/export/files/{fn}", export_file)
     app.router.add_get("/locations", locations)
     app.router.add_get("/health", health)
     app.cleanup_ctx.append(background)
