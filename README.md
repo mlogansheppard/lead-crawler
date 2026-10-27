@@ -29,7 +29,15 @@ All calls need header `X-API-Key: <API_KEY>`.
 - `GET /jobs/{id}/csv` -> finished listing rows
 - `GET /jobs/{id}/reviews.csv` -> kept low-star reviews
 
-Jobs live in memory for 24h. A container restart loses running jobs (n8n gets a 404 and stops with an error).
+## If DataForSEO stops (bad key, out of balance, outage)
+
+The job pauses instead of failing, and everything already paid for is kept in `./data`.
+- Out of balance: top up. Paused jobs retry by themselves every 10 minutes.
+- Wrong or changed key: fix `.env`, then `docker compose up -d`. The crawler restarts and continues the job.
+- To retry right away: `curl -X POST -H "X-API-Key: $API_KEY" 172.17.0.1:8088/jobs/<job_id>/resume`
+
+n8n keeps waiting while a job is paused and shows the reason in the sheet's Status column.
+Jobs (and their files) are kept for 7 days.
 
 ## Tests
 

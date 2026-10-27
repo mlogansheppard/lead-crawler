@@ -69,7 +69,9 @@ async def _wait(client, job):
     raise AssertionError("job did not finish")
 
 
-def test_email_job():
+def test_email_job(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+
     async def run():
         site, base = await _start_site()
         client = TestClient(TestServer(server.make_app()))
@@ -89,7 +91,9 @@ def test_email_job():
     assert by["9"]["error"] == "skipped"
 
 
-def test_maps_job(monkeypatch):
+def test_maps_job(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+
     async def run():
         site, base = await _start_site()
         posted = []
@@ -179,3 +183,89 @@ _real_sleep = asyncio.sleep
 
 async def _fast_sleep(_s):
     await _real_sleep(0)
+
+
+def test_pause_on_no_balance_then_resume_after_restart(monkeypatch, tmp_path):
+    """DataForSEO says 'insufficient funds' partway through. The job pauses, keeps what it paid for,
+    survives a crawler restart, and finishes without re-posting tasks that were already accepted."""
+    async def run():
+        site, base = await _start_site()
+        state = {"broke": True}
+        posted_keywords = []
+        reviews_posted = []
+
+        async def task_post(r):
+            body = await r.json()
+            # first chunk is accepted; while "broke", the next chunk is refused
+            if state["broke"] and posted_keywords:
+                return web.json_response({"status_code": 40210, "status_message": "Insufficient funds.", "tasks": []}, status=402)
+            out = []
+            for b in body:
+                posted_keywords.append(b["keyword"])
+                out.append({"id": "m%d" % len(posted_keywords), "status_code": 20100, "cost": 0.0006})
+            return web.json_response({"status_code": 20000, "tasks": out})
+
+        async def task_get(r):
+            n = r.match_info["tid"]
+            return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": [
+                {"type": "maps_search", "title": "Biz " + n, "cid": n, "url": base, "address": "1 Main St, Austin, TX 78701",
+                 "address_info": {"address": "1 Main St"}, "category": "Plumber"}]}]}]})
+
+        async def r_task_post(r):
+            body = await r.json()
+            reviews_posted.extend(body)
+            return web.json_response({"tasks": [{"id": "r" + b["cid"], "status_code": 20100} for b in body]})
+
+        async def r_task_get(r):
+            return web.json_response({"tasks": [{"status_code": 20000, "data": {"sort_by": "lowest_rating"},
+                                                 "result": [{"items": [{"rating": {"value": 1}, "review_text": "awful"}]}]}]})
+
+        dfs = web.Application()
+        dfs.router.add_post("/task_post", task_post)
+        dfs.router.add_get("/task_get/advanced/{tid}", task_get)
+        dfs.router.add_post("/r/task_post", r_task_post)
+        dfs.router.add_get("/r/task_get/{tid}", r_task_get)
+        dfs_srv = TestServer(dfs)
+        await dfs_srv.start_server()
+        monkeypatch.setattr(server.maps, "DFS_BASE", f"http://127.0.0.1:{dfs_srv.port}")
+        monkeypatch.setattr(server.maps, "DFS_REVIEWS_BASE", f"http://127.0.0.1:{dfs_srv.port}/r")
+        monkeypatch.setattr(server.maps, "DFS_LOGIN", "x")
+        monkeypatch.setattr(server.maps, "POLL_SECONDS", 0)
+        monkeypatch.setattr(server.maps.asyncio, "sleep", _fast_sleep)
+        monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(server, "RESUME_EVERY", 3600)
+        server.JOBS.clear()
+
+        # 150 city tasks -> 2 post chunks (100 + 50); the second one hits "insufficient funds"
+        tasks = [{"city": f"Town{i} 7{i:04d}", "category": "plumber", "state_code": "TX"} for i in range(150)]
+        client = TestClient(TestServer(server.make_app()))
+        await client.start_server()
+        jid = (await (await client.post("/maps-jobs", json={"tasks": tasks, "job_key": "plumber|g2"})).json())["job_id"]
+        j = await _wait(client, jid)
+        assert j["status"] == "paused" and "40210" in j["pause_reason"], j
+        assert len(posted_keywords) == 100
+        await client.close()  # crawler stops
+
+        # balance topped up, crawler restarts: it reloads the saved job from disk and continues by itself
+        state["broke"] = False
+        server.JOBS.clear()
+        client = TestClient(TestServer(server.make_app()))
+        await client.start_server()
+        j = await _wait(client, jid)
+        # re-sending the same job_key hands back the same job instead of paying again
+        again = await (await client.post("/maps-jobs", json={"tasks": tasks, "job_key": "plumber|g2"})).json()
+        text = await (await client.get(f"/jobs/{jid}/csv")).text()
+        rtext = await (await client.get(f"/jobs/{jid}/reviews.csv")).text()
+        await client.close()
+        await site.close()
+        await dfs_srv.close()
+        return j, again, text, rtext, posted_keywords, reviews_posted
+
+    j, again, text, rtext, posted_keywords, reviews_posted = asyncio.run(run())
+    assert j["status"] == "done", j
+    assert len(posted_keywords) == 150 and len(set(posted_keywords)) == 150  # nothing posted twice
+    assert again["job_id"] and again["reused"] is True
+    rows = list(csv.DictReader(io.StringIO(text)))
+    assert len(rows) == 150 and all(r["EMAIL"] == "owner@gmail.com" for r in rows)
+    assert all(b["sort_by"] == "lowest_rating" for b in reviews_posted) and len(reviews_posted) == 150
+    assert len(list(csv.DictReader(io.StringIO(rtext)))) == 150

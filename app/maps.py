@@ -68,125 +68,178 @@ def slim(item, search_city):
     }
 
 
-async def _post_and_collect(s, post_url, get_url, tasks, on_ready, stats, progress):
-    """Generic DataForSEO standard-queue flow.
-    tasks: list of (body_dict, key). on_ready(key, task_json) is called for every finished task."""
-    pending = {}
-    for i in range(0, len(tasks), 100):
-        chunk = tasks[i:i + 100]
-        body = [b for b, _ in chunk]
-        data = None
+class DFSPaused(Exception):
+    """DataForSEO refused us (bad key, no balance, or unreachable). Job state is kept so it can resume."""
+
+
+def _pause_reason(http_status, data):
+    code = (data or {}).get("status_code") if isinstance(data, dict) else None
+    msg = (data or {}).get("status_message", "") if isinstance(data, dict) else ""
+    if http_status in (401, 402, 403) or (code and 40100 <= int(code) < 40300):
+        return f"DataForSEO {code or http_status}: {msg or 'not authorized / payment required'}"
+    return None
+
+
+def new_stage(tasks):
+    """Persistable state for one DataForSEO stage. tasks: list of (body_dict, key)."""
+    return {"todo": [[b, k] for b, k in tasks], "pending": {}, "stats": {
+        "tasks": len(tasks), "posted": 0, "post_errors": 0, "collected": 0, "failed": 0, "cost": 0.0}}
+
+
+async def run_stage(s, post_url, get_url, state, on_ready, save):
+    """Post everything in state['todo'] and collect everything in state['pending'].
+    Safe to call again after a pause or restart: already-posted tasks are never posted (or paid for) twice.
+    Raises DFSPaused on auth/balance/network problems with state left intact."""
+    stats = state["stats"]
+    # 1) post what's left, 100 tasks per call
+    while state["todo"]:
+        chunk = state["todo"][:100]
+        data, http_status = None, None
         for attempt in range(3):
             try:
-                async with s.post(post_url, json=body) as r:
+                async with s.post(post_url, json=[b for b, _ in chunk]) as r:
+                    http_status = r.status
                     data = await r.json(content_type=None)
                 break
             except Exception:
                 await asyncio.sleep(3 * (attempt + 1))
-        got = (data or {}).get("tasks") or []
-        for idx, t in enumerate(got):
-            if t.get("status_code") == 20100 and t.get("id") and idx < len(chunk):
-                pending[t["id"]] = chunk[idx][1]
+        if data is None:
+            save(force=True)
+            raise DFSPaused("DataForSEO unreachable while posting tasks")
+        reason = _pause_reason(http_status, data)
+        if reason:
+            save(force=True)
+            raise DFSPaused(reason)
+        got = data.get("tasks") or []
+        retry, pause = [], None
+        for idx, item in enumerate(chunk):
+            t = got[idx] if idx < len(got) else None
+            code = (t or {}).get("status_code")
+            if t and code == 20100 and t.get("id"):
+                state["pending"][t["id"]] = item[1]
                 stats["posted"] += 1
                 stats["cost"] = round(stats["cost"] + float(t.get("cost") or 0), 5)
+            elif code and 40100 <= int(code) < 40300:
+                retry.append(item)
+                pause = f"DataForSEO {code}: {t.get('status_message', '')}"
             else:
-                stats["post_errors"] += 1
-        if data is None:
-            stats["post_errors"] += len(chunk)
-        progress(stats)
+                stats["post_errors"] += 1  # bad task (e.g. invalid field) - skip it
+        state["todo"] = retry + state["todo"][len(chunk):]
+        save()
+        if pause:
+            save(force=True)
+            raise DFSPaused(pause)
 
+    # 2) collect
     sem = asyncio.Semaphore(25)
 
     async def get_one(tid):
         async with sem:
             try:
                 async with s.get(get_url.format(tid)) as r:
-                    return tid, await r.json(content_type=None)
+                    return tid, r.status, await r.json(content_type=None)
             except Exception:
-                return tid, None
+                return tid, None, None
 
-    waited = 0
-    await asyncio.sleep(min(60, POLL_SECONDS))
-    while pending and waited < MAX_WAIT_SECONDS:
-        for tid, data in await asyncio.gather(*(get_one(t) for t in list(pending))):
-            t = ((data or {}).get("tasks") or [None])[0]
+    waited, first = 0, True
+    while state["pending"] and waited < MAX_WAIT_SECONDS:
+        if first:
+            await asyncio.sleep(min(60, POLL_SECONDS))
+            first = False
+        results = await asyncio.gather(*(get_one(t) for t in list(state["pending"])))
+        if all(d is None for _, _, d in results):
+            save(force=True)
+            raise DFSPaused("DataForSEO unreachable while collecting results")
+        pause = None
+        for tid, http_status, data in results:
+            if data is None:
+                continue
+            reason = _pause_reason(http_status, data)
+            if reason:
+                pause = reason
+                continue
+            t = (data.get("tasks") or [None])[0]
             if not t:
                 continue
             code = t.get("status_code")
             if code == 20000:
-                key = pending.pop(tid)
+                key = state["pending"].pop(tid)
                 stats["collected"] += 1
                 on_ready(key, t)
             elif code in (40601, 40602):
-                continue  # still in queue / handed
+                continue  # still queued
+            elif code and 40100 <= int(code) < 40300:
+                pause = f"DataForSEO {code}: {t.get('status_message', '')}"
             else:
-                pending.pop(tid)
+                state["pending"].pop(tid)
                 stats["failed"] += 1
-        stats["pending"] = len(pending)
-        progress(stats)
-        if pending:
+        stats["pending"] = len(state["pending"])
+        save()
+        if pause:
+            save(force=True)
+            raise DFSPaused(pause)
+        if state["pending"]:
             await asyncio.sleep(POLL_SECONDS)
             waited += POLL_SECONDS
-    stats["timed_out"] = len(pending)
+    stats["timed_out"] = len(state["pending"])
+    state["pending"] = {}
+    save(force=True)
 
 
-def _session():
+def session():
     if not DFS_LOGIN:
-        raise RuntimeError("DFS_LOGIN / DFS_PASSWORD are not set on the crawler")
+        raise DFSPaused("DFS_LOGIN / DFS_PASSWORD are not set on the crawler (.env)")
     return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), headers=_auth_header())
 
 
-async def run_maps(tasks, depth, language_code, progress):
-    """Google Maps search for every task. Returns (rows deduped by CID, stats)."""
-    stats = {"tasks": len(tasks), "posted": 0, "post_errors": 0, "collected": 0, "failed": 0, "items": 0, "ads_skipped": 0, "cost": 0.0}
-    rows_by_cid = {}
+def maps_tasks(tasks, depth, language_code):
+    return [({"keyword": build_keyword(t), "location_code": 2840, "language_code": language_code,
+              "depth": depth, "tag": str(t.get("city", ""))[:250]}, str(t.get("city", ""))) for t in tasks]
 
+
+def maps_on_ready(rows_by_cid, stats):
     def on_ready(city, t):
         for res in t.get("result") or []:
             for it in res.get("items") or []:
                 if it.get("type") != "maps_search":
-                    stats["ads_skipped"] += 1
+                    stats["ads_skipped"] = stats.get("ads_skipped", 0) + 1
                     continue
-                stats["items"] += 1
+                stats["items"] = stats.get("items", 0) + 1
                 row = slim(it, city)
                 rows_by_cid.setdefault(row["CID"] or (row["NAME"] + "|" + row["FULL ADDRESS"]), row)
+    return on_ready
 
-    bodies = [({"keyword": build_keyword(t), "location_code": 2840, "language_code": language_code,
-                "depth": depth, "tag": str(t.get("city", ""))[:250]}, str(t.get("city", ""))) for t in tasks]
-    async with _session() as s:
-        await _post_and_collect(s, f"{DFS_BASE}/task_post", DFS_BASE + "/task_get/advanced/{}", bodies, on_ready, stats, progress)
-    stats["unique_places"] = len(rows_by_cid)
-    return list(rows_by_cid.values()), stats
+
+async def run_maps_stage(state, rows_by_cid, save):
+    async with session() as s:
+        await run_stage(s, f"{DFS_BASE}/task_post", DFS_BASE + "/task_get/advanced/{}", state,
+                        maps_on_ready(rows_by_cid, state["stats"]), save)
+    state["stats"]["unique_places"] = len(rows_by_cid)
 
 
 def _review_images(it):
-    imgs = it.get("images") or []
     urls = []
-    for im in imgs:
-        if isinstance(im, dict):
-            u = im.get("image_url") or im.get("url") or ""
-        else:
-            u = str(im)
+    for im in it.get("images") or []:
+        u = (im.get("image_url") or im.get("url") or "") if isinstance(im, dict) else str(im)
         if u:
             urls.append(u)
     return ", ".join(urls)
 
 
-async def run_reviews(cids, depth, keep, max_rating, language_code, progress):
-    """Lowest-rated reviews per CID. Keeps up to `keep` reviews with rating <= max_rating
-    (reviews with text first). Returns (review rows, stats)."""
-    stats = {"businesses": len(cids), "posted": 0, "post_errors": 0, "collected": 0, "failed": 0,
-             "reviews_seen": 0, "kept": 0, "businesses_with_kept": 0, "cost": 0.0}
-    out = []
+def reviews_tasks(cids, depth, language_code):
+    # sort_by is always lowest_rating: the whole point is the worst reviews
+    return [({"cid": c, "location_code": 2840, "language_code": language_code, "depth": depth,
+              "sort_by": "lowest_rating", "tag": c}, c) for c in cids]
 
+
+def reviews_on_ready(out, stats, keep, max_rating):
     def on_ready(cid, t):
-        # DataForSEO echoes the task settings back; flag any task that wasn't sorted lowest-first
         if ((t.get("data") or {}).get("sort_by") or "lowest_rating") != "lowest_rating":
             stats["not_lowest_first"] = stats.get("not_lowest_first", 0) + 1
         picked = []
         for res in t.get("result") or []:
             for it in res.get("items") or []:
-                stats["reviews_seen"] += 1
+                stats["reviews_seen"] = stats.get("reviews_seen", 0) + 1
                 val = (it.get("rating") or {}).get("value")
                 try:
                     val = float(val)
@@ -198,17 +251,17 @@ async def run_reviews(cids, depth, keep, max_rating, language_code, progress):
                 picked.append({"CID": cid, "SCORE": int(val) if val == int(val) else val, "TEXT": text,
                                "PICTURES": _review_images(it), "USER NAME": it.get("profile_name") or "",
                                "REVIEW DATE": it.get("timestamp") or "", "REVIEW URL": it.get("review_url") or ""})
-        # lowest rating first (belt and braces on top of sort_by=lowest_rating), then reviews with text;
-        # the sort is stable so DataForSEO's own order is kept inside each group
+        # lowest rating first, then reviews with text; stable so DataForSEO's own order is kept inside each group
         picked.sort(key=lambda r: (r["SCORE"], 0 if r["TEXT"] else 1))
         picked = picked[:keep]
         if picked:
-            stats["businesses_with_kept"] += 1
-            stats["kept"] += len(picked)
+            stats["businesses_with_kept"] = stats.get("businesses_with_kept", 0) + 1
+            stats["kept"] = stats.get("kept", 0) + len(picked)
             out.extend(picked)
+    return on_ready
 
-    bodies = [({"cid": c, "location_code": 2840, "language_code": language_code, "depth": depth,
-                "sort_by": "lowest_rating", "tag": c}, c) for c in cids]
-    async with _session() as s:
-        await _post_and_collect(s, f"{DFS_REVIEWS_BASE}/task_post", DFS_REVIEWS_BASE + "/task_get/{}", bodies, on_ready, stats, progress)
-    return out, stats
+
+async def run_reviews_stage(state, out, keep, max_rating, save):
+    async with session() as s:
+        await run_stage(s, f"{DFS_REVIEWS_BASE}/task_post", DFS_REVIEWS_BASE + "/task_get/{}", state,
+                        reviews_on_ready(out, state["stats"], keep, max_rating), save)

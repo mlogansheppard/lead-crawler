@@ -13,6 +13,11 @@ services:
       - CONCURRENCY=80
       - PAGE_TIMEOUT=12
       - SITE_BUDGET=45
+      - DATA_DIR=/data
+      - RESUME_EVERY_SECONDS=600
+    volumes:
+      # saved job progress, so a paused or restarted job picks up where it left off
+      - ./data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/health')"]
       interval: 60s

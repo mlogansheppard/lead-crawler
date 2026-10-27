@@ -16,11 +16,18 @@ All requests need header  X-API-Key: <API_KEY env>.
 
   Maps jobs also take "reviews": {"enabled": true, "depth": 20, "keep": 5, "max_rating": 1}
   (DataForSEO reviews sorted lowest_rating; keeps up to `keep` reviews rated <= max_rating, ones with text first).
+  POST /jobs/{id}/resume        -> continue a paused job now (paused jobs also retry by themselves every 10 min)
   GET  /health
+
+  Maps jobs are saved to DATA_DIR. If DataForSEO rejects the key / runs out of balance / is unreachable, the job
+  is marked "paused" (nothing paid for is lost). It resumes on its own every RESUME_EVERY_SECONDS, and on startup,
+  so after fixing .env:  docker compose up -d  and it carries on. "job_key" (e.g. "plumber|g2") makes re-sending the
+  same job return the existing one instead of paying again.
 """
 import asyncio
 import csv
 import io
+import json
 import os
 import re
 import time
@@ -41,7 +48,6 @@ PAGE_TIMEOUT = float(os.environ.get("PAGE_TIMEOUT", "12"))
 SITE_BUDGET = float(os.environ.get("SITE_BUDGET", "45"))
 MAX_EMAILS = 5
 MAX_BYTES = 2_500_000
-JOB_TTL = 24 * 3600
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
 FB_RE = re.compile(r"https?://(?:www\.|m\.)?facebook\.com/(?!sharer|share|plugins|tr\b|dialog|login|policy|privacy)[A-Za-z0-9_.\-/?=]+", re.I)
@@ -125,75 +131,187 @@ async def crawl_many(sites, max_pages, on_done=None):
                 r = {"id": s.get("id", ""), "url": s.get("url", ""), "emails": [], "facebook": "", "pages": 0, "error": str(e)[:200]}
             results.append(r)
             if on_done:
-                on_done()
+                on_done(r)
         await asyncio.gather(*(one(s) for s in sites))
     return results
+
+
+# ---------------------------------------------------------------- job persistence
+# Every maps job is saved to DATA_DIR as JSON, so a pause (bad DataForSEO key / no balance) or a container
+# restart never loses paid-for work. Paused and interrupted jobs resume automatically.
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+RESUME_EVERY = int(os.environ.get("RESUME_EVERY_SECONDS", "600"))
+KEEP_DAYS = 7
+_last_save = {}
+
+
+def job_path(job_id):
+    return os.path.join(DATA_DIR, f"job-{job_id}.json")
+
+
+def save_job(job, force=False):
+    now = time.monotonic()
+    if not force and now - _last_save.get(job["id"], 0) < 30:
+        return
+    _last_save[job["id"]] = now
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = job_path(job["id"]) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(job, f)
+        os.replace(tmp, job_path(job["id"]))
+    except Exception:
+        traceback.print_exc()
+
+
+def load_jobs():
+    if not os.path.isdir(DATA_DIR):
+        return
+    for name in os.listdir(DATA_DIR):
+        if not (name.startswith("job-") and name.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(DATA_DIR, name)) as f:
+                job = json.load(f)
+            JOBS[job["id"]] = job
+        except Exception:
+            traceback.print_exc()
 
 
 # ---------------------------------------------------------------- jobs
 def new_job(kind, **extra):
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"kind": kind, "status": "running", "phase": "queued", "created_at": time.time(),
-                    "stats": {}, "rows": [], "reviews": [], "results": [], "error": "", **extra}
+    JOBS[job_id] = {"id": job_id, "kind": kind, "status": "running", "phase": "queued", "created_at": time.time(),
+                    "active_s": 0.0, "stats": {}, "rows": [], "reviews": [], "results": [], "error": "",
+                    "pause_reason": "", "paused_at": None, **extra}
     return job_id, JOBS[job_id]
 
 
-async def run_email_job(job, sites, max_pages):
+async def run_email_job(job):
+    p = job["params"]
     job["phase"] = "emails"
-    job["stats"] = {"sites": len(sites), "crawled": 0}
+    job["stats"] = {"sites": len(p["sites"]), "crawled": 0}
 
-    def tick():
+    def tick(_r):
         job["stats"]["crawled"] += 1
-    job["results"] = await crawl_many(sites, max_pages, tick)
+    job["results"] = await crawl_many(p["sites"], p["max_pages"], tick)
     job["stats"]["with_email"] = sum(1 for r in job["results"] if r["emails"])
 
 
-async def run_maps_job(job, tasks, depth, max_pages, language_code, reviews):
-    job["phase"] = "maps"
-    rows, mstats = await maps.run_maps(tasks, depth, language_code, lambda s: job["stats"].update(maps=dict(s)))
-    job["stats"]["maps"] = mstats
+def _site_key(url):
+    home = normalize_site(url)
+    if not home:
+        return ""
+    u = urlparse(home)
+    return registrable(u.hostname or "") + u.path.rstrip("/")
 
-    # one crawl per unique website (chains / franchises share a site)
-    by_site = {}
+
+async def run_maps_job(job):
+    """Resumable: each stage records what it finished, so calling this again continues where it stopped."""
+    p = job["params"]
+    save = lambda force=False: save_job(job, force)  # noqa: E731
+
+    # 1) DataForSEO Maps
+    if not job.get("maps_done"):
+        job["phase"] = "maps"
+        if "maps_state" not in job:
+            job["maps_state"] = maps.new_stage(maps.maps_tasks(p["tasks"], p["depth"], p["language_code"]))
+            job["maps_rows"] = {}
+        await maps.run_maps_stage(job["maps_state"], job["maps_rows"], save)
+        job["maps_done"] = True
+        save(True)
+
+    rows = list(job["maps_rows"].values())
+
+    # 2) website emails (free, but still remembered so a restart doesn't redo finished sites)
+    if not job.get("emails_done"):
+        job["phase"] = "emails"
+        by_site = {}
+        for r in rows:
+            k = _site_key(r["WEBSITE"])
+            if k:
+                by_site.setdefault(k, {"url": r["WEBSITE"], "n": 0})["n"] += 1
+        done = job.setdefault("crawl_results", {})
+        est = job["stats"].setdefault("emails", {})
+        est.update({"listings": len(rows), "with_website": sum(v["n"] for v in by_site.values()),
+                    "unique_sites": len(by_site), "crawled": len(done)})
+
+        def tick(r):
+            done[r["id"]] = {"emails": r["emails"], "facebook": r["facebook"]}
+            est["crawled"] = len(done)
+            save()
+        todo = [{"id": k, "url": v["url"]} for k, v in by_site.items() if k not in done]
+        await crawl_many(todo, p["max_pages"], tick)
+        job["emails_done"] = True
+        save(True)
+
+    done = job.get("crawl_results", {})
     for r in rows:
-        home = normalize_site(r["WEBSITE"])
-        if home:
-            key = registrable(urlparse(home).hostname or "") + urlparse(home).path.rstrip("/")
-            by_site.setdefault(key, {"id": key, "url": r["WEBSITE"], "rows": []})["rows"].append(r)
-    job["phase"] = "emails"
-    job["stats"]["emails"] = {"listings": len(rows), "with_website": sum(len(v["rows"]) for v in by_site.values()),
-                              "unique_sites": len(by_site), "crawled": 0}
-
-    def tick():
-        job["stats"]["emails"]["crawled"] += 1
-    results = await crawl_many([{"id": k, "url": v["url"]} for k, v in by_site.items()], max_pages, tick)
-    for res in results:
-        for r in by_site[res["id"]]["rows"]:
-            r["EMAIL"] = ", ".join(res["emails"])
-            r["FACEBOOK"] = res["facebook"]
-    job["stats"]["emails"]["listings_with_email"] = sum(1 for r in rows if r["EMAIL"])
+        res = done.get(_site_key(r["WEBSITE"]))
+        r["EMAIL"] = ", ".join(res["emails"]) if res else ""
+        r["FACEBOOK"] = res["facebook"] if res else ""
+    job["stats"].setdefault("emails", {})["listings_with_email"] = sum(1 for r in rows if r["EMAIL"])
     job["rows"] = rows
 
-    # lowest-rated reviews, only for businesses we can actually email
-    if reviews.get("enabled", True):
-        cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"]))
+    # 3) DataForSEO reviews, lowest rating first, only for businesses we can email
+    rv = p["reviews"]
+    if rv["enabled"] and not job.get("reviews_done"):
         job["phase"] = "reviews"
-        job["reviews"], rstats = await maps.run_reviews(
-            cids, reviews["depth"], reviews["keep"], reviews["max_rating"], language_code,
-            lambda st: job["stats"].update(reviews=dict(st)))
-        job["stats"]["reviews"] = rstats
+        if "reviews_state" not in job:
+            cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"]))
+            job["reviews_state"] = maps.new_stage(maps.reviews_tasks(cids, rv["depth"], p["language_code"]))
+            job["reviews"] = []
+        await maps.run_reviews_stage(job["reviews_state"], job["reviews"], rv["keep"], rv["max_rating"], save)
+        job["reviews_done"] = True
 
 
-async def guard(job, coro):
+def _collect_stats(job):
+    st = dict(job.get("stats") or {})
+    if "maps_state" in job:
+        st["maps"] = job["maps_state"]["stats"]
+    if "reviews_state" in job:
+        st["reviews"] = job["reviews_state"]["stats"]
+    return st
+
+
+async def guard(job, runner):
+    job["status"], job["error"], job["pause_reason"] = "running", "", ""
+    started = job["_started"] = time.time()
     try:
-        await coro
+        await runner(job)
         job["status"] = "done"
+        job["phase"] = "done"
+        job["finished_at"] = time.time()
+    except maps.DFSPaused as e:
+        job["status"] = "paused"
+        job["pause_reason"] = str(e)
+        job["paused_at"] = time.time()
+        print(f"job {job['id']} paused: {e}", flush=True)
     except Exception as e:
         job["status"] = "error"
+        job["phase"] = "error"
         job["error"] = f"{type(e).__name__}: {e}"
         traceback.print_exc()
-    job["phase"] = job["status"]
-    job["finished_at"] = time.time()
+    job["active_s"] = job.get("active_s", 0) + (time.time() - started)
+    if job["kind"] == "maps":
+        save_job(job, force=True)
+
+
+RUNNING = set()
+
+
+def start(job):
+    if job["id"] in RUNNING:
+        return
+    RUNNING.add(job["id"])
+    runner = run_maps_job if job["kind"] == "maps" else run_email_job
+
+    async def go():
+        try:
+            await guard(job, runner)
+        finally:
+            RUNNING.discard(job["id"])
+    asyncio.get_running_loop().create_task(go())
 
 
 # ---------------------------------------------------------------- http
@@ -212,16 +330,29 @@ async def create_maps_job(request):
     tasks = [t for t in body.get("tasks", []) if isinstance(t, dict) and (t.get("keyword") or t.get("city"))]
     if not tasks:
         return web.json_response({"error": "no tasks"}, status=400)
-    depth = max(20, min(int(body.get("depth", 200)), 700))
-    max_pages = max(1, min(int(body.get("max_pages", 10)), 20))
+    job_key = str(body.get("job_key", "")).strip().lower()[:200]
+    # same job_key (e.g. "plumber|g2") within KEEP_DAYS -> hand back that job instead of paying again
+    if job_key:
+        for j in sorted(JOBS.values(), key=lambda j: j["created_at"], reverse=True):
+            if j.get("job_key") == job_key and j["status"] != "error" and time.time() - j["created_at"] < KEEP_DAYS * 86400:
+                if j["status"] == "paused":
+                    start(j)
+                return web.json_response({"job_id": j["id"], "tasks": len(j["params"]["tasks"]), "reused": True, "status": j["status"]})
     rv = body.get("reviews") or {}
-    reviews = {"enabled": bool(rv.get("enabled", True)),
-               "depth": max(10, min(int(rv.get("depth", 20)), 200)),
-               "keep": max(1, min(int(rv.get("keep", 5)), 50)),
-               "max_rating": float(rv.get("max_rating", 1))}
-    job_id, job = new_job("maps", label=str(body.get("label", ""))[:200])
-    asyncio.get_running_loop().create_task(guard(job, run_maps_job(job, tasks, depth, max_pages, body.get("language_code", "en"), reviews)))
-    return web.json_response({"job_id": job_id, "tasks": len(tasks)})
+    params = {
+        "tasks": tasks,
+        "depth": max(20, min(int(body.get("depth", 200)), 700)),
+        "max_pages": max(1, min(int(body.get("max_pages", 10)), 20)),
+        "language_code": body.get("language_code", "en"),
+        "reviews": {"enabled": bool(rv.get("enabled", True)),
+                    "depth": max(10, min(int(rv.get("depth", 20)), 200)),
+                    "keep": max(1, min(int(rv.get("keep", 5)), 50)),
+                    "max_rating": float(rv.get("max_rating", 1))},
+    }
+    job_id, job = new_job("maps", label=str(body.get("label", ""))[:200], job_key=job_key, params=params)
+    save_job(job, force=True)
+    start(job)
+    return web.json_response({"job_id": job_id, "tasks": len(tasks), "reused": False})
 
 
 async def create_email_job(request):
@@ -229,17 +360,30 @@ async def create_email_job(request):
         return deny()
     body = await request.json()
     sites = [s for s in body.get("sites", []) if isinstance(s, dict) and s.get("url")]
-    max_pages = max(1, min(int(body.get("max_pages", 10)), 20))
-    job_id, job = new_job("emails")
-    asyncio.get_running_loop().create_task(guard(job, run_email_job(job, sites, max_pages)))
+    job_id, job = new_job("emails", params={"sites": sites, "max_pages": max(1, min(int(body.get("max_pages", 10)), 20))})
+    start(job)
     return web.json_response({"job_id": job_id, "total": len(sites)})
 
 
 def get_job_or_404(request):
     job = JOBS.get(request.match_info["job_id"])
     if not job:
-        return None, web.json_response({"error": "unknown job (expired, or the crawler restarted)"}, status=404)
+        return None, web.json_response({"error": "unknown job"}, status=404)
     return job, None
+
+
+def _progress(job, stats):
+    ph = job.get("phase")
+    if ph == "maps" and "maps" in stats:
+        m = stats["maps"]
+        return f"maps {m.get('collected', 0)}/{m.get('tasks', 0)} searches"
+    if ph == "emails" and "emails" in stats:
+        e = stats["emails"]
+        return f"emails {e.get('crawled', 0)}/{e.get('unique_sites', 0)} sites"
+    if ph == "reviews" and "reviews" in stats:
+        r = stats["reviews"]
+        return f"reviews {r.get('collected', 0)}/{r.get('tasks', 0)} businesses"
+    return ph or ""
 
 
 async def job_status(request):
@@ -248,9 +392,26 @@ async def job_status(request):
     job, err = get_job_or_404(request)
     if err:
         return err
-    return web.json_response({"kind": job["kind"], "status": job["status"], "phase": job["phase"], "error": job["error"],
-                              "stats": job["stats"], "rows": len(job["rows"]), "review_rows": len(job["reviews"]),
-                              "elapsed_s": round((job.get("finished_at") or time.time()) - job["created_at"])})
+    stats = _collect_stats(job)
+    live = job["id"] in RUNNING and job["status"] == "running"
+    active = job.get("active_s", 0) + ((time.time() - job.get("_started", time.time())) if live else 0)
+    return web.json_response({
+        "kind": job["kind"], "status": job["status"], "phase": job["phase"], "progress": _progress(job, stats),
+        "error": job["error"], "pause_reason": job.get("pause_reason", ""), "stats": stats,
+        "rows": len(job["rows"]), "review_rows": len(job["reviews"]),
+        "elapsed_s": round((job.get("finished_at") or time.time()) - job["created_at"]), "active_s": round(active)})
+
+
+async def resume_job(request):
+    if not authed(request):
+        return deny()
+    job, err = get_job_or_404(request)
+    if err:
+        return err
+    if job["status"] in ("paused", "error") and job["kind"] == "maps":
+        start(job)
+        return web.json_response({"resumed": True})
+    return web.json_response({"resumed": False, "status": job["status"]})
 
 
 async def job_output(request):
@@ -278,16 +439,32 @@ async def job_output(request):
 
 
 async def health(_):
-    return web.json_response({"ok": True, "jobs": len(JOBS), "dfs_configured": bool(maps.DFS_LOGIN)})
+    paused = [j["id"] for j in JOBS.values() if j["status"] == "paused"]
+    return web.json_response({"ok": True, "jobs": len(JOBS), "running": len(RUNNING), "paused": paused,
+                              "dfs_configured": bool(maps.DFS_LOGIN)})
 
 
-async def janitor(app):
+async def background(app):
+    """On startup: reload saved jobs and continue any that were running or paused.
+    Then every RESUME_EVERY seconds retry paused jobs (e.g. after a DataForSEO top-up) and clean up old ones."""
+    load_jobs()
+    for j in list(JOBS.values()):
+        if j["kind"] == "maps" and j["status"] in ("running", "paused"):
+            start(j)
+
     async def loop():
         while True:
-            await asyncio.sleep(600)
+            await asyncio.sleep(RESUME_EVERY)
             now = time.time()
-            for k in [k for k, j in JOBS.items() if now - j["created_at"] > JOB_TTL]:
-                JOBS.pop(k, None)
+            for j in list(JOBS.values()):
+                if j["status"] == "paused":
+                    start(j)
+                elif now - j["created_at"] > KEEP_DAYS * 86400 and j["id"] not in RUNNING:
+                    JOBS.pop(j["id"], None)
+                    try:
+                        os.remove(job_path(j["id"]))
+                    except OSError:
+                        pass
     task = asyncio.get_running_loop().create_task(loop())
     yield
     task.cancel()
@@ -298,10 +475,11 @@ def make_app():
     app.router.add_post("/maps-jobs", create_maps_job)
     app.router.add_post("/jobs", create_email_job)
     app.router.add_get("/jobs/{job_id}", job_status)
+    app.router.add_post("/jobs/{job_id}/resume", resume_job)
     app.router.add_get("/jobs/{job_id}/csv", job_output)
     app.router.add_get("/jobs/{job_id}/{what:reviews}.csv", job_output)
     app.router.add_get("/health", health)
-    app.cleanup_ctx.append(janitor)
+    app.cleanup_ctx.append(background)
     return app
 
 
