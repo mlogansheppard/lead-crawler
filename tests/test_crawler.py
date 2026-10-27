@@ -658,3 +658,22 @@ def test_time_budget_starts_when_site_gets_a_slot(monkeypatch):
         return res
     res = asyncio.run(go())
     assert all(r["pages"] >= 2 for r in res), [r["pages"] for r in res]
+
+
+def test_no_low_review_possible():
+    f = server.no_low_review_possible
+    assert f({"RATING": "5.0", "REVIEWS COUNT": "15"}, 3) is True     # a 3-star would pull 15 reviews below 4.9
+    assert f({"RATING": "5.0", "REVIEWS COUNT": "25"}, 3) is False
+    assert f({"RATING": "5.0", "REVIEWS COUNT": "30"}, 1) is True
+    assert f({"RATING": "4.6", "REVIEWS COUNT": "8"}, 3) is False
+    assert f({"RATING": "", "REVIEWS COUNT": "0"}, 3) is True
+    assert f({"RATING": "", "REVIEWS COUNT": ""}, 3) is False
+    assert f({"ONE STAR RATINGS": "0", "RATING": "4.0", "REVIEWS COUNT": "200"}, 1) is True
+
+
+def test_reviews_text_first_then_lowest():
+    out, stats = [], {}
+    items = [{"rating": {"value": 1}, "review_text": ""}, {"rating": {"value": 2}, "review_text": "bad"},
+             {"rating": {"value": 3}, "review_text": "meh"}, {"rating": {"value": 4}, "review_text": "ok"}]
+    server.maps.reviews_on_ready(out, stats, 5, 3)("c1", {"result": [{"items": items}]})
+    assert [r["SCORE"] for r in out] == [2, 3, 1]

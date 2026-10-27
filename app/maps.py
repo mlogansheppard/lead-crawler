@@ -302,8 +302,9 @@ def reviews_on_ready(out, stats, keep, max_rating):
                 picked.append({"CID": cid, "SCORE": int(val) if val == int(val) else val, "TEXT": text,
                                "PICTURES": _review_images(it), "USER NAME": it.get("profile_name") or "",
                                "REVIEW DATE": it.get("timestamp") or "", "REVIEW URL": it.get("review_url") or ""})
-        # lowest rating first, then reviews with text; stable so DataForSEO's own order is kept inside each group
-        picked.sort(key=lambda r: (r["SCORE"], 0 if r["TEXT"] else 1))
+        # reviews with text first (lowest rating first among them), then text-less ones (lowest first);
+        # a 2-star with text beats a 1-star with none. Stable, so DataForSEO's order is kept inside each group
+        picked.sort(key=lambda r: (0 if r["TEXT"] else 1, r["SCORE"]))
         picked = picked[:keep]
         if picked:
             stats["businesses_with_kept"] = stats.get("businesses_with_kept", 0) + 1

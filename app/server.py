@@ -423,10 +423,9 @@ async def run_maps_job(job):
             job["reviews_kept_prev"] = job.get("reviews_kept_prev", 0) + st["stats"].get("kept", 0)
             del job["reviews_state"]
         if "reviews_state" not in job:
-            # skip businesses Google says have zero 1-star ratings (no point paying for their reviews)
+            # skip businesses that can't have a review at or below max_rating (no point paying for their reviews)
             def wants(r):
-                ones = str(r.get("ONE STAR RATINGS", "")).strip()
-                return not (rv["max_rating"] <= 1 and ones == "0")
+                return not no_low_review_possible(r, rv["max_rating"])
             reviewed = set(job.get("reviewed_cids", []))
             cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"] and wants(r) and r["CID"] not in reviewed))
             job["stats"]["reviews_skipped_no_1star"] = sum(1 for r in rows if r["EMAIL"] and r["CID"] and not wants(r))
@@ -435,6 +434,25 @@ async def run_maps_job(job):
             job.setdefault("reviews", [])
         await maps.run_reviews_stage(job["reviews_state"], job["reviews"], rv["keep"], rv["max_rating"], save)
         job["reviews_done"] = True
+
+
+def no_low_review_possible(r, max_rating):
+    """True when the listing can't contain a review rated <= max_rating: Google's star breakdown says so
+    (1-star only), or the math does. One review of m stars caps the average at 5 - (5 - m) / n; the shown
+    rating is rounded, so 0.1 of slack is left before ruling it out."""
+    if max_rating <= 1 and str(r.get("ONE STAR RATINGS", "")).strip() == "0":
+        return True
+    try:
+        n = int(str(r.get("REVIEWS COUNT", "")).strip())
+    except ValueError:
+        return False
+    if n == 0:
+        return True
+    try:
+        value = float(str(r.get("RATING", "")).strip())
+    except ValueError:
+        return False
+    return value - 0.1 > 5 - (5 - max_rating) / n
 
 
 async def run_adaptive_maps(job, save):
