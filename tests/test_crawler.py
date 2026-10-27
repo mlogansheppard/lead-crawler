@@ -531,3 +531,8 @@ def test_queue_limits_parallel_jobs(monkeypatch, tmp_path):
     first, final = asyncio.run(run())
     assert first.count("running") == 2 and first.count("queued") == 3, first
     assert final == ["done"] * 5, final
+
+
+def test_no_cut_off_fragments_near_other_at_signs():
+    html = '<li>' + 'x' * 60 + ' mary-ann@gmail.com, sales@bestroofing.net</li><img srcset="logo@2x.png 2x"><p>john.smith@gmail.com</p><style>@media(max-width:600px){.a{color:red}}</style>'
+    assert sorted(extract.extract_emails(html)) == ["john.smith@gmail.com", "mary-ann@gmail.com", "sales@bestroofing.net"]

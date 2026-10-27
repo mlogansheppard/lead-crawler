@@ -32,7 +32,7 @@ BAD_DOMAINS = {
     "schema.org", "w3.org", "googlemail.co", "latofonts.com", "typemade.mx", "indiantypefoundry.com",
 }
 BAD_DOMAIN_SUFFIXES = (".wixpress.com", ".sentry.io", ".ingest.sentry.io")
-BAD_LOCAL = re.compile(r"^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster|abuse|user|username|name|your-?email|yourname|your\.?name|firstname|first\.?last|first_last|lastname|john\.?doe|jane\.?doe|johnsmith|john\.smith|test|example|sample|someone|somebody|you|me|email-?address|emailaddress)$", re.I)
+BAD_LOCAL = re.compile(r"^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster|abuse|user|username|name|your-?email|yourname|your\.?name|firstname|first\.?last|first_last|lastname|john\.?doe|jane\.?doe|test|example|sample|someone|somebody|you|me|email-?address|emailaddress)$", re.I)
 HEXHASH_LOCAL = re.compile(r"^[0-9a-f]{16,}$", re.I)
 # role addresses that should never go into a cold email campaign
 ROLE_DROP = {
@@ -172,7 +172,8 @@ def _decode_escapes(raw: str) -> str:
 
 
 OBF_HINT_RE = re.compile(r"[\[({]\s*at\s*[\])}]|\sdot\s", re.I)
-MAX_AT_SIGNS = 4000
+MAX_AT_SIGNS = 20000
+_BOUNDARY = set(" \t\r\n<>\"'(),;:[]{}|/=")
 
 
 def extract_emails(raw_html: str) -> list:
@@ -193,6 +194,11 @@ def extract_emails(raw_html: str) -> list:
         n += 1
         if i >= last_end:  # skip "@" signs already inside the previous window
             lo, hi = max(0, i - 90), i + 140
+            # never start the window in the middle of a word/email, or we'd pick up a cut-off fragment
+            # like "mith@gmail.com" from "john.smith@gmail.com"
+            stop = max(0, lo - 80)
+            while lo > stop and decoded[lo - 1] not in _BOUNDARY:
+                lo -= 1
             w = html.unescape(TAG_RE.sub(" ", decoded[lo:hi]))
             found += EMAIL_RE.findall(w)
             found += ["{}@{}".format(*m) for m in SPACED_AT_RE.findall(w)]
