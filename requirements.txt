@@ -1,2 +1,3 @@
 aiohttp==3.14.5
 zipcodes==3.0.0
+dnspython==2.7.0

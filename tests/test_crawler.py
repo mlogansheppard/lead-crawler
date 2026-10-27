@@ -11,7 +11,10 @@ from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
 import extract  # noqa: E402
+import mxcheck  # noqa: E402
 import server  # noqa: E402
+
+mxcheck.ENABLED = False  # no real DNS in tests
 
 
 def test_extract_variants():
@@ -380,3 +383,68 @@ def test_account_problem_codes():
     assert server.maps.is_account_problem(40100, "You are not authorized to access this resource.")
     assert not server.maps.is_account_problem(40501, "Invalid Field")
     assert server.maps._pause_reason(200, {"status_code": 40102, "status_message": "No Search Results."}) is None
+
+
+def test_finds_builder_and_obfuscated_emails():
+    wix = '<html><body><div id="app"></div><script>window.__DATA__={"contact":{"mail":"owner\\u0040acmeroofing.com"}}</script></body></html>'
+    assert "owner@acmeroofing.com" in extract.extract_emails(wix)
+    assert "office@acmeroofing.com" in extract.extract_emails("<p>Email: office @ acmeroofing.com</p>")
+    assert "sam@acmeroofing.com" in extract.extract_emails('<a href="mailto:sam%40acmeroofing.com">mail</a>')
+    junk = '<script>Sentry.init({dsn:"https://abc123def4567890abc123def4567890@o1.ingest.sentry.io/1"})</script><img srcset="logo@2x.png 2x">'
+    assert extract.extract_emails(junk) == []
+
+
+def test_email_ranking_and_role_drops():
+    emails = ["support@agencyweb.com", "billing@acme.com", "acmeplumb@gmail.com", "info@acme.com",
+              "careers@acme.com", "privacy@acme.com", "john.smith@acme.com", "webmaster@acme.com"]
+    typed = extract.rank_emails_typed(emails, "https://www.acme.com/")
+    assert typed == [("john.smith@acme.com", "personal"), ("info@acme.com", "role"), ("acmeplumb@gmail.com", "free"),
+                     ("billing@acme.com", "low"), ("support@agencyweb.com", "other")], typed
+
+
+def test_sitemap_links():
+    xml = "<urlset><url><loc>https://acme.com/services</loc></url><url><loc>https://acme.com/contact-acme</loc></url><url><loc>https://other.com/contact</loc></url></urlset>"
+    pages, children = extract.sitemap_links(xml, "https://acme.com/")
+    assert pages == ["https://acme.com/contact-acme"] and children == []
+    pages, children = extract.sitemap_links("<sitemapindex><sitemap><loc>https://acme.com/page-sitemap.xml</loc></sitemap></sitemapindex>", "https://acme.com/")
+    assert children == ["https://acme.com/page-sitemap.xml"]
+
+
+def test_sitemap_fallback_finds_hidden_contact_page(monkeypatch, tmp_path):
+    async def run():
+        async def home(r):
+            return web.Response(text="<html><body><nav id=menu></nav></body></html>", content_type="text/html")
+
+        async def sitemap(r):
+            base = f"http://127.0.0.1:{r.url.port}"
+            return web.Response(text=f"<urlset><url><loc>{base}/reach-our-team</loc></url></urlset>", content_type="application/xml")
+
+        async def page(r):
+            return web.Response(text="Write to dana@gmail.com", content_type="text/html")
+        app = web.Application()
+        app.router.add_get("/", home)
+        app.router.add_get("/sitemap.xml", sitemap)
+        app.router.add_get("/reach-our-team", page)
+        srv = TestServer(app)
+        await srv.start_server()
+        res = await server.crawl_many([{"id": "a", "url": f"http://127.0.0.1:{srv.port}/"}], 10)
+        await srv.close()
+        return res[0]
+    r = asyncio.run(run())
+    assert r["emails"] == ["dana@gmail.com"] and r["types"] == ["free"], r
+
+
+def test_agency_and_dead_domain_filter(monkeypatch):
+    async def fake_dead(domains):
+        return {"deadshop.com"}
+    monkeypatch.setattr(server.mxcheck, "dead_domains", fake_dead)
+    done = {
+        "a.com": {"emails": ["info@a.com", "hello@pixelagency.com"], "types": ["role", "other"], "facebook": ""},
+        "b.com": {"emails": ["bob@b.com", "hello@pixelagency.com"], "types": ["personal", "other"], "facebook": ""},
+        "c.com": {"emails": ["team@pixelagency.com"], "types": ["other"], "facebook": ""},
+        "deadshop.com": {"emails": ["info@deadshop.com", "deadshop@gmail.com"], "types": ["role", "free"], "facebook": ""},
+    }
+    stats = asyncio.run(server.clean_job_emails(done))
+    assert done["a.com"]["emails"] == ["info@a.com"] and done["b.com"]["emails"] == ["bob@b.com"]
+    assert done["c.com"]["emails"] == [] and done["deadshop.com"]["emails"] == ["deadshop@gmail.com"]
+    assert stats["agency_or_template"] == 3 and stats["dead_domain"] == 1 and stats["agency_domains"] == ["pixelagency.com"]

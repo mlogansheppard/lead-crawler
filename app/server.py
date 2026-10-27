@@ -41,8 +41,9 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 from aiohttp import web
 
-from extract import (GUESSED_PATHS, contact_links, extract_emails, normalize_site,
-                     rank_emails, registrable)
+from extract import (FREE_PROVIDERS, GUESSED_PATHS, contact_links, extract_emails, normalize_site,
+                     rank_emails_typed, registrable, sitemap_links)
+import mxcheck
 import maps
 
 API_KEY = os.environ.get("API_KEY", "")
@@ -64,7 +65,7 @@ async def fetch(session, url):
     try:
         async with session.get(url, allow_redirects=True, max_redirects=6, ssl=False) as r:
             ctype = r.headers.get("content-type", "")
-            if r.status >= 400 or (ctype and "html" not in ctype and "text" not in ctype):
+            if r.status >= 400 or (ctype and not any(t in ctype for t in ("html", "text", "xml"))):
                 return None, str(r.url)
             body = await r.content.read(MAX_BYTES)
             return body.decode(r.charset or "utf-8", errors="replace"), str(r.url)
@@ -74,7 +75,7 @@ async def fetch(session, url):
 
 async def crawl_site(session, site, max_pages):
     sid, raw_url = site.get("id", ""), site.get("url", "")
-    res = {"id": sid, "url": raw_url, "emails": [], "facebook": "", "pages": 0, "error": ""}
+    res = {"id": sid, "url": raw_url, "emails": [], "types": [], "facebook": "", "pages": 0, "error": ""}
     home = normalize_site(raw_url)
     if not home:
         res["error"] = "skipped"
@@ -95,6 +96,15 @@ async def crawl_site(session, site, max_pages):
 
         root = "{0.scheme}://{0.netloc}".format(urlparse(final))
         queue = contact_links(page, final)
+        if len(queue) < 2 and max_pages > 1:
+            # menus built by JavaScript hide their links; the sitemap still lists the contact/about pages
+            sm, _ = await fetch(session, urljoin(root, "/sitemap.xml"))
+            if sm and "<loc>" in sm.lower():
+                pages, children = sitemap_links(sm, final)
+                if not pages and children:
+                    sub_sm, _ = await fetch(session, children[0])
+                    pages, _ = sitemap_links(sub_sm or "", final)
+                queue += [u for u in pages if u not in queue]
         for g in GUESSED_PATHS:
             u = urljoin(root, g)
             if u not in queue:
@@ -105,7 +115,7 @@ async def crawl_site(session, site, max_pages):
             if res["pages"] >= max_pages or time.monotonic() - started > SITE_BUDGET:
                 break
             # once we have an on-domain email and have checked at least one more page, stop early
-            if res["pages"] >= 2 and any(registrable(e.split("@")[1]) == site_reg for e in emails):
+            if res["pages"] >= 3 and any(registrable(e.split("@")[1]) == site_reg for e in emails):
                 break
             if u.rstrip("/") in visited:
                 continue
@@ -117,7 +127,9 @@ async def crawl_site(session, site, max_pages):
             for e in extract_emails(sub):
                 if e not in emails:
                     emails.append(e)
-        res["emails"] = rank_emails(emails, final)[:MAX_EMAILS]
+        typed = rank_emails_typed(emails, final)[:MAX_EMAILS]
+        res["emails"] = [e for e, _ in typed]
+        res["types"] = [t for _, t in typed]
     return res
 
 
@@ -201,6 +213,45 @@ async def run_email_job(job):
     job["stats"]["with_email"] = sum(1 for r in job["results"] if r["emails"])
 
 
+AGENCY_MIN_SITES = int(os.environ.get("AGENCY_MIN_SITES", "3"))
+
+
+async def clean_job_emails(done):
+    """Job-wide cleanup after crawling:
+    - an address, or a non-free domain that isn't the site's own, showing up on AGENCY_MIN_SITES+ different
+      websites is a web-design agency / theme / template footer, not the business: drop it
+    - drop emails whose domain can't receive mail (no MX and no A record), so MillionVerifier credits aren't wasted"""
+    by_email, by_domain = {}, {}
+    for site, res in done.items():
+        site_reg = site.split("/")[0]
+        for e in res["emails"]:
+            by_email.setdefault(e, set()).add(site)
+            dom = e.split("@")[1]
+            if dom not in FREE_PROVIDERS and registrable(dom) != site_reg:
+                by_domain.setdefault(registrable(dom), set()).add(site)
+    agency_emails = {e for e, sites in by_email.items() if len(sites) >= AGENCY_MIN_SITES}
+    agency_domains = {d for d, sites in by_domain.items() if len(sites) >= AGENCY_MIN_SITES}
+    domains = {e.split("@")[1] for res in done.values() for e in res["emails"]}
+    dead = await mxcheck.dead_domains(domains)
+    dropped = {"agency_or_template": 0, "dead_domain": 0}
+    for site, res in done.items():
+        site_reg = site.split("/")[0]
+        keep_e, keep_t = [], []
+        for e, t in zip(res["emails"], res.get("types") or ["role"] * len(res["emails"])):
+            dom = e.split("@")[1]
+            if e in agency_emails or (registrable(dom) in agency_domains and registrable(dom) != site_reg):
+                dropped["agency_or_template"] += 1
+                continue
+            if dom in dead:
+                dropped["dead_domain"] += 1
+                continue
+            keep_e.append(e)
+            keep_t.append(t)
+        res["emails"], res["types"] = keep_e, keep_t
+    dropped["agency_domains"] = sorted(agency_domains)[:50]
+    return dropped
+
+
 def _site_key(url):
     home = normalize_site(url)
     if not home:
@@ -243,11 +294,12 @@ async def run_maps_job(job):
                     "unique_sites": len(by_site), "crawled": len(done)})
 
         def tick(r):
-            done[r["id"]] = {"emails": r["emails"], "facebook": r["facebook"]}
+            done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"]}
             est["crawled"] = len(done)
             save()
         todo = [{"id": k, "url": v["url"]} for k, v in by_site.items() if k not in done]
         await crawl_many(todo, p["max_pages"], tick)
+        job["email_filter"] = await clean_job_emails(done)
         job["emails_done"] = True
         save(True)
 
@@ -255,7 +307,9 @@ async def run_maps_job(job):
     for r in rows:
         res = done.get(_site_key(r["WEBSITE"]))
         r["EMAIL"] = ", ".join(res["emails"]) if res else ""
+        r["EMAIL TYPES"] = ", ".join(res.get("types", [])) if res else ""
         r["FACEBOOK"] = res["facebook"] if res else ""
+    job["stats"].setdefault("emails", {})["filtered"] = job.get("email_filter", {})
     job["stats"].setdefault("emails", {})["listings_with_email"] = sum(1 for r in rows if r["EMAIL"])
     job["rows"] = rows
 
