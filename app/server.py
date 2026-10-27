@@ -90,12 +90,13 @@ async def crawl_site(session, site, max_pages):
             res["error"] = "unreachable"
             return res
         res["pages"] = 1
-        emails = extract_emails(page)
+        # page scanning is CPU work: run it off the event loop so status checks from n8n stay instant
+        emails = await asyncio.to_thread(extract_emails, page)
         fb = FB_RE.search(page)
         res["facebook"] = fb.group(0).split("?")[0] if fb else ""
 
         root = "{0.scheme}://{0.netloc}".format(urlparse(final))
-        queue = contact_links(page, final)
+        queue = await asyncio.to_thread(contact_links, page, final)
         # Google's own "contact" link for the listing goes first, if it's on the same site
         cu = site.get("contact_url") or ""
         if cu and registrable(urlparse(cu).hostname or "") == registrable(urlparse(final).hostname or ""):
@@ -128,7 +129,7 @@ async def crawl_site(session, site, max_pages):
             if sub is None:
                 continue
             res["pages"] += 1
-            for e in extract_emails(sub):
+            for e in await asyncio.to_thread(extract_emails, sub):
                 if e not in emails:
                     emails.append(e)
         typed = rank_emails_typed(emails, final)[:MAX_EMAILS]
@@ -170,7 +171,7 @@ def job_path(job_id):
 
 def save_job(job, force=False):
     now = time.monotonic()
-    if not force and now - _last_save.get(job["id"], 0) < 30:
+    if not force and now - _last_save.get(job["id"], 0) < 60:
         return
     _last_save[job["id"]] = now
     try:

@@ -159,7 +159,7 @@ def extract_emails(raw_html: str) -> list:
     found += ["{}@{}.{}".format(*m) for m in OBFUSCATED_RE.findall(text)]
     found += ["{}@{}".format(*m) for m in SPACED_AT_RE.findall(text)]
     # site builders often put the contact email only inside script/JSON data
-    decoded = html.unescape(_decode_escapes(raw_html))
+    decoded = html.unescape(_decode_escapes(raw_html[:1_500_000]))
     found += [m for m in MAILTO_RE.findall(decoded)]
     found += EMAIL_RE.findall(decoded)
     seen, out = set(), []
