@@ -29,9 +29,11 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    # hard memory cap so the crawler can never starve n8n; if it is ever hit, the container restarts
-    # and the job carries on from its saved progress
-    mem_limit: 1500m
+    # hard memory cap so the crawler can never starve n8n (VPS has 7.8 GB, n8n uses ~1 GB); if it is ever hit,
+    # the container restarts and the job carries on from its saved progress. Swap is kept small on purpose:
+    # a crawler living in swap crawls ~13 sites/min instead of ~500
+    mem_limit: 3500m
+    memswap_limit: 4000m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/health')"]
       interval: 60s

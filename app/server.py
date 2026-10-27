@@ -194,7 +194,15 @@ async def crawl_many(sites, max_pages, on_done=None, concurrency=None, page_time
             results.append(r)
             if on_done:
                 on_done(r)
-        await asyncio.gather(*(one(s) for s in sites))
+        # a fixed pool of workers pulling from the list, instead of one task per site: an 18,000-site
+        # job no longer creates 18,000 tasks (and their memory) up front
+        queue = list(sites)
+        queue.reverse()
+
+        async def worker():
+            while queue:
+                await one(queue.pop())
+        await asyncio.gather(*(worker() for _ in range(min(len(queue), concurrency or CONCURRENCY) or 1)))
     return results
 
 
@@ -212,6 +220,8 @@ def job_path(job_id):
 
 
 def save_job(job, force=False):
+    if job.get("_light"):
+        return  # never overwrite the full file with the lightened in-memory copy
     now = time.monotonic()
     if not force and now - _last_save.get(job["id"], 0) < 60:
         return
@@ -226,6 +236,34 @@ def save_job(job, force=False):
         traceback.print_exc()
 
 
+# Big per-job data. A finished job keeps only its status and stats in memory; the rest stays on disk and is
+# read back when a file is downloaded or a re-crawl starts. (Holding every finished job's full data in memory
+# is what pushed the crawler past its memory limit on the first full-state run.)
+HEAVY = ("rows", "reviews", "results", "crawl_results", "maps_rows", "plan", "node_counts", "searched_kw",
+         "deep_done", "frontier", "deep_round")
+
+
+def lighten(job):
+    if job.get("_light") or job.get("status") != "done":
+        return
+    job["_counts"] = {"rows": len(job.get("rows") or []), "reviews": len(job.get("reviews") or [])}
+    for k in HEAVY:
+        job.pop(k, None)
+    job["_light"] = True
+
+
+def full_job(job):
+    """The job with all its data (a copy read from disk when the in-memory one was lightened)."""
+    if not job.get("_light"):
+        return job
+    with open(job_path(job["id"])) as f:
+        return json.load(f)
+
+
+def _count(job, what):
+    return job["_counts"][what] if job.get("_light") else len(job.get(what) or [])
+
+
 def load_jobs():
     if not os.path.isdir(DATA_DIR):
         return
@@ -235,6 +273,7 @@ def load_jobs():
         try:
             with open(os.path.join(DATA_DIR, name)) as f:
                 job = json.load(f)
+            lighten(job)
             JOBS[job["id"]] = job
         except Exception:
             traceback.print_exc()
@@ -358,13 +397,17 @@ async def run_maps_job(job):
         job["maps_done"] = True
         save(True)
 
-    rows = list(job["maps_rows"].values())
+    # rows come from maps_rows the first time; afterwards maps_rows is emptied and job["rows"] is the source
+    # (one copy of the list in memory and on disk instead of two)
+    from_maps = bool(job.get("maps_rows"))
+    rows = list(job["maps_rows"].values()) if from_maps else list(job.get("rows") or [])
     # Google pads thin areas with businesses from other states (national chains, telehealth, mobile services).
     # Those belong to another group's run, so drop them here, before paying for their reviews.
     wanted = {str(s).upper() for s in p.get("states") or []}
     if wanted:
         keep = [r for r in rows if not r.get("STATE CODE") or str(r["STATE CODE"]).upper() in wanted]
-        job["stats"]["dropped_outside_states"] = len(rows) - len(keep)
+        if from_maps:
+            job["stats"]["dropped_outside_states"] = len(rows) - len(keep)
         rows = keep
 
     # 2) website emails (free, but still remembered so a restart doesn't redo finished sites)
@@ -420,6 +463,9 @@ async def run_maps_job(job):
     job["stats"].setdefault("emails", {})["filtered"] = job.get("email_filter", {})
     job["stats"].setdefault("emails", {})["listings_with_email"] = sum(1 for r in rows if r["EMAIL"])
     job["rows"] = rows
+    job["maps_rows"] = {}
+    for k in ("plan", "node_counts", "searched_kw", "deep_done", "frontier", "deep_round"):
+        job.pop(k, None)  # only needed while the Maps searches run
 
     # 3) DataForSEO reviews, lowest rating first, only for businesses we can email
     rv = p["reviews"]
@@ -617,6 +663,8 @@ def start(job):
     async def go():
         try:
             await guard(job, runner)
+            if job["kind"] == "maps":
+                lighten(job)
         finally:
             RUNNING.discard(job["id"])
             start_next()
@@ -731,8 +779,20 @@ async def job_status(request):
     return web.json_response({
         "kind": job["kind"], "status": job["status"], "phase": job["phase"], "progress": _progress(job, stats),
         "error": job["error"], "pause_reason": job.get("pause_reason", ""), "stats": stats,
-        "rows": len(job["rows"]), "review_rows": len(job["reviews"]),
-        "elapsed_s": round((job.get("finished_at") or time.time()) - job["created_at"]), "active_s": round(active)})
+        "rows": _count(job, "rows"), "review_rows": _count(job, "reviews"),
+        "elapsed_s": round((job.get("finished_at") or time.time()) - job["created_at"]), "active_s": round(active),
+        "crawler_mem_mb": _rss_mb()})
+
+
+def _rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return None
 
 
 async def resume_job(request):
@@ -757,6 +817,8 @@ async def recrawl_job(request):
         return err
     if job["kind"] != "maps" or job["status"] not in ("done", "error"):
         return web.json_response({"recrawl": False, "status": job["status"]}, status=409)
+    job = full_job(job)
+    JOBS[job["id"]] = job
     if "reviewed_cids" not in job:  # jobs from before this version: everything with an email was reviewed
         job["reviewed_cids"] = sorted({r["CID"] for r in job.get("rows", []) if r.get("EMAIL") and r.get("CID")})
     done = job.get("crawl_results", {})
@@ -783,6 +845,7 @@ async def job_output(request):
     if job["kind"] == "emails":
         return web.json_response({"results": job["results"]})
     want_reviews = request.match_info.get("what") == "reviews"
+    job = await asyncio.get_running_loop().run_in_executor(SCAN_POOL, full_job, job)
     rows = job["reviews"] if want_reviews else job["rows"]
     buf = io.StringIO()
     if want_reviews:
@@ -802,6 +865,7 @@ async def job_output(request):
 # names to clean, and the finished files.
 
 def _export_base(job):
+    job = full_job(job)
     p = job["params"]
     codes = [str(c).upper() for c in p.get("states") or []]
     names = [k for k, v in STATE_NAMES.items() if v in set(codes)]
@@ -854,6 +918,14 @@ async def export_mv_results(request):
     mv = {} if skipped else exporter.parse_mv_csv((await request.read()).decode("utf-8", errors="replace"))
     if not skipped and not mv:
         return web.json_response({"error": "MillionVerifier results had no rows"}, status=400)
+    def persist():
+        j = full_job(job)
+        j["mv_results"], j["mv_skipped"] = mv, skipped
+        if j is not job:  # lightened job: write the full copy back to disk
+            with open(job_path(j["id"]) + ".tmp", "w") as f:
+                json.dump(j, f)
+            os.replace(job_path(j["id"]) + ".tmp", job_path(j["id"]))
+    await asyncio.get_running_loop().run_in_executor(SCAN_POOL, persist)
     job["mv_results"], job["mv_skipped"] = mv, skipped
     save_job(job, force=True)
     keep = request.query.get("keep", "ok,catch_all").split(",")

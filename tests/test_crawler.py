@@ -774,3 +774,37 @@ def test_export_endpoints_end_to_end(monkeypatch, tmp_path):
     assert [(r["EMAIL"], r["COMPANY NAME"], r["MV RESULT"], r["TEXT"]) for r in w] == [("a@acme.com", "Acme Spa", "ok", "bad, really")]
     lo = list(csv.DictReader(io.StringIO(files["medspa - G5 - LowScoreNoText 10-26.csv"].lstrip("﻿"))))
     assert [(r["EMAIL"], r["SCORE"], r["MV RESULT"]) for r in lo] == [("hi@glow.com", "2", "not_verified")]
+
+
+def test_finished_job_is_light_in_memory_but_complete_on_disk(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+    job = {"id": "lj", "kind": "maps", "status": "done", "created_at": 0, "params": {"states": ["NJ"], "reviews": {"keep": 5}},
+           "stats": {}, "rows": [{"CID": "1", "EMAIL": "a@b.com", "STATE CODE": "NJ", "NAME": "A"}],
+           "reviews": [{"CID": "1", "SCORE": 1, "TEXT": "bad"}], "crawl_results": {"b.com": {"emails": ["a@b.com"]}}}
+    server.save_job(job, force=True)
+    server.lighten(job)
+    assert job["_light"] and "rows" not in job and server._count(job, "rows") == 1
+    server.save_job(job, force=True)  # must not overwrite the full file
+    full = server.full_job(job)
+    assert full["rows"][0]["EMAIL"] == "a@b.com" and full["crawl_results"]
+    server.JOBS.clear()
+    server.load_jobs()
+    assert server.JOBS["lj"]["_light"]
+    _, _, merged, _ = server._export_base(server.JOBS["lj"])
+    assert merged[0]["BUCKET"] == "wReview"
+
+
+def test_crawl_many_runs_every_site_with_a_small_pool():
+    async def go():
+        async def home(r):
+            return web.Response(text="mail me at x@site.com", content_type="text/html")
+        site = web.Application()
+        site.router.add_get("/", home)
+        srv = TestServer(site)
+        await srv.start_server()
+        sites = [{"id": str(i), "url": f"http://127.0.0.1:{srv.port}/?n={i}"} for i in range(40)]
+        res = await server.crawl_many(sites, 1, concurrency=3)
+        await srv.close()
+        return res
+    res = asyncio.run(go())
+    assert sorted(int(r["id"]) for r in res) == list(range(40))
