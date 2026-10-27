@@ -681,3 +681,33 @@ def test_reviews_text_first_then_lowest():
              {"rating": {"value": 3}, "review_text": "meh"}, {"rating": {"value": 4}, "review_text": "ok"}]
     server.maps.reviews_on_ready(out, stats, 5, 3)("c1", {"result": [{"items": items}]})
     assert [r["SCORE"] for r in out] == [2, 3, 1]
+
+
+def test_full_zip_gets_one_deep_research(monkeypatch):
+    # county (full) -> one ZIP that is also full at depth 100 -> re-searched once at max depth, then stops
+    plan = {"roots": ["c"], "nodes": {"c": {"kw": "medspa in X County", "label": "X", "children": ["z"]},
+                                      "z": {"kw": "medspa in 11111", "label": "11111", "children": []}}}
+    monkeypatch.setattr(server.maps, "build_plan", lambda *a, **k: plan)
+
+    class _S:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+    monkeypatch.setattr(server.maps, "session", lambda: _S())
+    calls = []
+
+    async def fake_stage(s, post, get, state, on_ready, save):
+        for body, nid in state["todo"]:
+            calls.append((nid, body["depth"]))
+            n = 100 if body["depth"] == 100 else 340
+            on_ready(nid, {"result": [{"items": [{"type": "maps_search", "title": f"{nid}{body['depth']}-{i}",
+                                                  "cid": f"{nid}{body['depth']}-{i}", "address": "1 Main St, Dover, DE 19901"}
+                                                 for i in range(n)]}]})
+        state["todo"] = []
+    monkeypatch.setattr(server.maps, "run_stage", fake_stage)
+    job = {"params": {"states": ["DE"], "category": "medspa", "split_at": 100, "depth": 100, "language_code": "en"}}
+    asyncio.run(server.run_adaptive_maps(job, lambda force=False: None))
+    assert calls == [("c", 100), ("z", 100), ("z", 700)], calls
+    assert len(job["maps_rows"]) == 100 + 100 + 340

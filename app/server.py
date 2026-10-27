@@ -475,7 +475,8 @@ async def run_adaptive_maps(job, save):
     while job["frontier"]:
         if "maps_state" not in job:
             job["round"] += 1
-            job["maps_state"] = maps.new_stage(maps.plan_round_tasks(plan, job["frontier"], p["depth"], p["language_code"]))
+            job["maps_state"] = maps.new_stage(maps.plan_round_tasks(plan, job["frontier"], p["depth"], p["language_code"],
+                                                                     job.get("deep_round", [])))
             save(True)
         st = job["maps_state"]
         async with maps.session() as s:
@@ -483,18 +484,28 @@ async def run_adaptive_maps(job, save):
                                  maps.adaptive_on_ready(plan, job["maps_rows"], job["node_counts"], st["stats"]), save)
         # decide what to split
         searched = set(job["searched_kw"]) | {plan["nodes"][n]["kw"] for n in job["frontier"]}
-        nxt, full = [], 0
+        deep_done = set(job.get("deep_done", [])) | set(job.get("deep_round", []))
+        # an area that hit the result limit but has nothing smaller to split into (a ZIP) gets one
+        # re-search at DataForSEO's max depth, so a cheap normal depth never cuts off businesses
+        full_at = min(p["split_at"], int(p["depth"] * 0.9))
+        nxt, deep, full = [], [], 0
         for nid in job["frontier"]:
-            if job["node_counts"].get(nid, 0) >= p["split_at"] and plan["nodes"][nid]["children"]:
+            n = job["node_counts"].get(nid, 0)
+            if n >= p["split_at"] and plan["nodes"][nid]["children"]:
                 full += 1
                 for c in plan["nodes"][nid]["children"]:
                     if plan["nodes"][c]["kw"] not in searched:
                         searched.add(plan["nodes"][c]["kw"])
                         nxt.append(c)
+            elif n >= full_at and not plan["nodes"][nid]["children"] and nid not in deep_done and p["depth"] < maps.DEEP_DEPTH:
+                deep.append(nid)
         job["rounds"].append({"round": job["round"], "searches": len(job["frontier"]), "split": full,
-                              "next": len(nxt), "cost": st["stats"]["cost"], "unique_places": len(job["maps_rows"])})
+                              "deep_next": len(deep), "next": len(nxt) + len(deep), "cost": st["stats"]["cost"],
+                              "unique_places": len(job["maps_rows"])})
         job["searched_kw"] = sorted(searched)
-        job["frontier"] = nxt
+        job["deep_done"] = sorted(deep_done)
+        job["deep_round"] = deep
+        job["frontier"] = nxt + deep
         del job["maps_state"]
         save(True)
 

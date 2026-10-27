@@ -363,9 +363,13 @@ def build_plan(state_codes, category, test_limit=0):
     return {"nodes": nodes, "roots": roots}
 
 
-def plan_round_tasks(plan, frontier, depth, language_code):
+DEEP_DEPTH = 700  # DataForSEO's max; only used to re-search an area that came back full and can't be split
+
+
+def plan_round_tasks(plan, frontier, depth, language_code, deep=()):
+    deep = set(deep)
     return [({"keyword": plan["nodes"][nid]["kw"], "location_code": 2840, "language_code": language_code,
-              "depth": depth, "tag": nid[:250]}, nid) for nid in frontier]
+              "depth": DEEP_DEPTH if nid in deep else depth, "tag": nid[:250]}, nid) for nid in frontier]
 
 
 def adaptive_on_ready(plan, rows_by_cid, counts, stats):
