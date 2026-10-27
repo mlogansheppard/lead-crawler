@@ -116,8 +116,9 @@ async def crawl_site(session, site, max_pages, sem=None):
     if not home:
         res["error"] = "skipped"
         return res
-    started = time.monotonic()
     async with (sem or SEM):
+        # the time budget starts once this site gets a crawl slot, not while it waits in line behind others
+        started = time.monotonic()
         page, final, err = await fetch_ex(session, home)
         if page is None:
             alt = "https://" + home[7:] if home.startswith("http://") else "http://" + home[8:]

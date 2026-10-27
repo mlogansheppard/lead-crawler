@@ -635,3 +635,26 @@ def test_one_star_inferred_from_average():
     assert _one_star({"rating": {"value": 4.2, "votes_count": 5}}) == ""
     assert _one_star({"rating": {"votes_count": 0}}) == 0
     assert _one_star({"rating": {"value": 5.0, "votes_count": 300}, "rating_distribution": {"1": 2}}) == 2
+
+
+def test_time_budget_starts_when_site_gets_a_slot(monkeypatch):
+    # sites queued behind others must still get their contact page crawled, not just the homepage
+    async def go():
+        async def home(r):
+            await asyncio.sleep(0.3)
+            return web.Response(text='<a href="/contact-us">Contact</a>', content_type="text/html")
+
+        async def contact(r):
+            return web.Response(text="email owner@acme.com", content_type="text/html")
+        site = web.Application()
+        site.router.add_get("/", home)
+        site.router.add_get("/contact-us", contact)
+        srv = TestServer(site)
+        await srv.start_server()
+        monkeypatch.setattr(server, "SITE_BUDGET", 0.5)
+        sites = [{"id": str(i), "url": f"http://127.0.0.1:{srv.port}/?n={i}"} for i in range(6)]
+        res = await server.crawl_many(sites, 5, concurrency=1)
+        await srv.close()
+        return res
+    res = asyncio.run(go())
+    assert all(r["pages"] >= 2 for r in res), [r["pages"] for r in res]
