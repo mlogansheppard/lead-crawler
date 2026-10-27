@@ -275,8 +275,10 @@ def test_pause_on_no_balance_then_resume_after_restart(monkeypatch, tmp_path):
     assert again["job_id"] and again["reused"] is True
     rows = list(csv.DictReader(io.StringIO(text)))
     assert len(rows) == 150 and all(r["EMAIL"] == "owner@gmail.com" for r in rows)
-    assert all(b["sort_by"] == "lowest_rating" for b in reviews_posted) and len(reviews_posted) == 150
-    assert len(list(csv.DictReader(io.StringIO(rtext)))) == 150
+    # all 150 listings share one website and email: one business, so one review lookup
+    assert all(b["sort_by"] == "lowest_rating" for b in reviews_posted) and len(reviews_posted) == 1
+    assert len(list(csv.DictReader(io.StringIO(rtext)))) == 1
+    assert j["stats"]["reviews_skipped_same_business"] == 149
 
 
 def test_locations():
@@ -711,3 +713,17 @@ def test_full_zip_gets_one_deep_research(monkeypatch):
     asyncio.run(server.run_adaptive_maps(job, lambda force=False: None))
     assert calls == [("c", 100), ("z", 100), ("z", 700)], calls
     assert len(job["maps_rows"]) == 100 + 100 + 340
+
+
+def test_one_review_lookup_per_business():
+    rows = [
+        {"CID": "a", "EMAIL": "x@chain.com", "WEBSITE": "https://chain.com", "RATING": "4.8", "REVIEWS COUNT": "300"},
+        {"CID": "b", "EMAIL": "x@chain.com", "WEBSITE": "https://chain.com", "RATING": "4.2", "REVIEWS COUNT": "90"},
+        {"CID": "c", "EMAIL": "x@chain.com", "WEBSITE": "https://other-site.com", "RATING": "4.0", "REVIEWS COUNT": "50"},
+        {"CID": "d", "EMAIL": "me@solo.com", "WEBSITE": "https://solo.com", "RATING": "4.9", "REVIEWS COUNT": "60"},
+        {"CID": "e", "EMAIL": "new@later.com", "WEBSITE": "https://done.com", "RATING": "3.0", "REVIEWS COUNT": "60"},
+        {"CID": "f", "EMAIL": "old@done.com", "WEBSITE": "https://done.com", "RATING": "4.5", "REVIEWS COUNT": "60"},
+    ]
+    cids, skipped = server.pick_review_cids(rows, {"f"}, lambda r: True)
+    # c is the lowest-rated listing with x@chain.com, so a and b (same email) are skipped; e shares f's website
+    assert cids == ["c", "d"] and skipped == 3

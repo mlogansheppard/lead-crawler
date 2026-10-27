@@ -434,13 +434,47 @@ async def run_maps_job(job):
             def wants(r):
                 return not no_low_review_possible(r, rv["max_rating"])
             reviewed = set(job.get("reviewed_cids", []))
-            cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"] and wants(r) and r["CID"] not in reviewed))
+            cids, same_biz = pick_review_cids(rows, reviewed, wants)
             job["stats"]["reviews_skipped_no_1star"] = sum(1 for r in rows if r["EMAIL"] and r["CID"] and not wants(r))
+            job["stats"]["reviews_skipped_same_business"] = same_biz
             job["reviews_state"] = maps.new_stage(maps.reviews_tasks(cids, rv["depth"], p["language_code"]))
             job["reviewed_cids"] = sorted(reviewed | set(cids))
             job.setdefault("reviews", [])
         await maps.run_reviews_stage(job["reviews_state"], job["reviews"], rv["keep"], rv["max_rating"], save)
         job["reviews_done"] = True
+
+
+def pick_review_cids(rows, reviewed, wants):
+    """One review lookup per business: listings that share a website or an email (chain locations, duplicate
+    Google listings) end up as one row per email in the final file anyway, so only the lowest-rated one is
+    looked up. Listings already looked up (earlier pass) count as covering their website and emails."""
+    def emails(r):
+        return {e.strip().lower() for e in str(r.get("EMAIL") or "").split(",") if e.strip()}
+
+    def rating(r):
+        try:
+            return float(r.get("RATING"))
+        except (TypeError, ValueError):
+            return 9.0
+    seen_sites, seen_emails = set(), set()
+    for r in rows:
+        if r.get("CID") in reviewed:
+            seen_sites.add(_site_key(r.get("WEBSITE") or "") or "")
+            seen_emails |= emails(r)
+    seen_sites.discard("")
+    cands = [r for r in rows if r.get("EMAIL") and r.get("CID") and r["CID"] not in reviewed and wants(r)]
+    cands.sort(key=lambda r: (rating(r), -int(r.get("REVIEWS COUNT") or 0) if str(r.get("REVIEWS COUNT") or "").isdigit() else 0))
+    picked, skipped = [], 0
+    for r in cands:
+        site, em = _site_key(r.get("WEBSITE") or ""), emails(r)
+        if r["CID"] in picked or (site and site in seen_sites) or (em & seen_emails):
+            skipped += 0 if r["CID"] in picked else 1
+            continue
+        picked.append(r["CID"])
+        if site:
+            seen_sites.add(site)
+        seen_emails |= em
+    return picked, skipped
 
 
 def no_low_review_possible(r, max_rating):
