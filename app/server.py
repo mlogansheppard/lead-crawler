@@ -11,7 +11,11 @@ All requests need header  X-API-Key: <API_KEY env>.
                     -> {"job_id": "..."}   (emails only, for websites you already have)
 
   GET  /jobs/{id}        -> status + stats (no rows)
-  GET  /jobs/{id}/csv    -> the finished rows as CSV (maps jobs) or JSON results (email-only jobs)
+  GET  /jobs/{id}/csv           -> the finished rows as CSV (maps jobs) or JSON results (email-only jobs)
+  GET  /jobs/{id}/reviews.csv   -> low-star reviews (CID, SCORE, TEXT, PICTURES, USER NAME, ...) for businesses with an email
+
+  Maps jobs also take "reviews": {"enabled": true, "depth": 20, "keep": 5, "max_rating": 1}
+  (DataForSEO reviews sorted lowest_rating; keeps up to `keep` reviews rated <= max_rating, ones with text first).
   GET  /health
 """
 import asyncio
@@ -130,7 +134,7 @@ async def crawl_many(sites, max_pages, on_done=None):
 def new_job(kind, **extra):
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"kind": kind, "status": "running", "phase": "queued", "created_at": time.time(),
-                    "stats": {}, "rows": [], "results": [], "error": "", **extra}
+                    "stats": {}, "rows": [], "reviews": [], "results": [], "error": "", **extra}
     return job_id, JOBS[job_id]
 
 
@@ -144,7 +148,7 @@ async def run_email_job(job, sites, max_pages):
     job["stats"]["with_email"] = sum(1 for r in job["results"] if r["emails"])
 
 
-async def run_maps_job(job, tasks, depth, max_pages, language_code):
+async def run_maps_job(job, tasks, depth, max_pages, language_code, reviews):
     job["phase"] = "maps"
     rows, mstats = await maps.run_maps(tasks, depth, language_code, lambda s: job["stats"].update(maps=dict(s)))
     job["stats"]["maps"] = mstats
@@ -169,6 +173,15 @@ async def run_maps_job(job, tasks, depth, max_pages, language_code):
             r["FACEBOOK"] = res["facebook"]
     job["stats"]["emails"]["listings_with_email"] = sum(1 for r in rows if r["EMAIL"])
     job["rows"] = rows
+
+    # lowest-rated reviews, only for businesses we can actually email
+    if reviews.get("enabled", True):
+        cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"]))
+        job["phase"] = "reviews"
+        job["reviews"], rstats = await maps.run_reviews(
+            cids, reviews["depth"], reviews["keep"], reviews["max_rating"], language_code,
+            lambda st: job["stats"].update(reviews=dict(st)))
+        job["stats"]["reviews"] = rstats
 
 
 async def guard(job, coro):
@@ -201,8 +214,13 @@ async def create_maps_job(request):
         return web.json_response({"error": "no tasks"}, status=400)
     depth = max(20, min(int(body.get("depth", 200)), 700))
     max_pages = max(1, min(int(body.get("max_pages", 10)), 20))
+    rv = body.get("reviews") or {}
+    reviews = {"enabled": bool(rv.get("enabled", True)),
+               "depth": max(10, min(int(rv.get("depth", 20)), 200)),
+               "keep": max(1, min(int(rv.get("keep", 5)), 50)),
+               "max_rating": float(rv.get("max_rating", 1))}
     job_id, job = new_job("maps", label=str(body.get("label", ""))[:200])
-    asyncio.get_running_loop().create_task(guard(job, run_maps_job(job, tasks, depth, max_pages, body.get("language_code", "en"))))
+    asyncio.get_running_loop().create_task(guard(job, run_maps_job(job, tasks, depth, max_pages, body.get("language_code", "en"), reviews)))
     return web.json_response({"job_id": job_id, "tasks": len(tasks)})
 
 
@@ -231,7 +249,7 @@ async def job_status(request):
     if err:
         return err
     return web.json_response({"kind": job["kind"], "status": job["status"], "phase": job["phase"], "error": job["error"],
-                              "stats": job["stats"], "rows": len(job["rows"]),
+                              "stats": job["stats"], "rows": len(job["rows"]), "review_rows": len(job["reviews"]),
                               "elapsed_s": round((job.get("finished_at") or time.time()) - job["created_at"])})
 
 
@@ -245,14 +263,18 @@ async def job_output(request):
         return web.json_response({"error": "job not finished", "status": job["status"]}, status=409)
     if job["kind"] == "emails":
         return web.json_response({"results": job["results"]})
-    rows = job["rows"]
+    want_reviews = request.match_info.get("what") == "reviews"
+    rows = job["reviews"] if want_reviews else job["rows"]
     buf = io.StringIO()
-    cols = list(rows[0].keys()) if rows else list(maps.slim({}, "").keys())
+    if want_reviews:
+        cols = ["CID", "SCORE", "TEXT", "PICTURES", "USER NAME", "REVIEW DATE", "REVIEW URL"]
+    else:
+        cols = list(rows[0].keys()) if rows else list(maps.slim({}, "").keys())
     w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
     w.writeheader()
     w.writerows(rows)
     return web.Response(text=buf.getvalue(), content_type="text/csv",
-                        headers={"Content-Disposition": "attachment; filename=maps.csv"})
+                        headers={"Content-Disposition": f"attachment; filename={'reviews' if want_reviews else 'maps'}.csv"})
 
 
 async def health(_):
@@ -277,6 +299,7 @@ def make_app():
     app.router.add_post("/jobs", create_email_job)
     app.router.add_get("/jobs/{job_id}", job_status)
     app.router.add_get("/jobs/{job_id}/csv", job_output)
+    app.router.add_get("/jobs/{job_id}/{what:reviews}.csv", job_output)
     app.router.add_get("/health", health)
     app.cleanup_ctx.append(janitor)
     return app

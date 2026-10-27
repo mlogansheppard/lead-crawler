@@ -9,6 +9,7 @@ import aiohttp
 DFS_LOGIN = os.environ.get("DFS_LOGIN", "")
 DFS_PASSWORD = os.environ.get("DFS_PASSWORD", "")
 DFS_BASE = "https://api.dataforseo.com/v3/serp/google/maps"
+DFS_REVIEWS_BASE = "https://api.dataforseo.com/v3/business_data/google/reviews"
 POLL_SECONDS = int(os.environ.get("DFS_POLL_SECONDS", "45"))
 MAX_WAIT_SECONDS = int(os.environ.get("DFS_MAX_WAIT_SECONDS", "5400"))
 
@@ -67,82 +68,142 @@ def slim(item, search_city):
     }
 
 
-async def run_maps(tasks, depth, language_code, progress):
-    """Post tasks to the standard queue, poll until all are collected. Returns (rows, stats)."""
+async def _post_and_collect(s, post_url, get_url, tasks, on_ready, stats, progress):
+    """Generic DataForSEO standard-queue flow.
+    tasks: list of (body_dict, key). on_ready(key, task_json) is called for every finished task."""
+    pending = {}
+    for i in range(0, len(tasks), 100):
+        chunk = tasks[i:i + 100]
+        body = [b for b, _ in chunk]
+        data = None
+        for attempt in range(3):
+            try:
+                async with s.post(post_url, json=body) as r:
+                    data = await r.json(content_type=None)
+                break
+            except Exception:
+                await asyncio.sleep(3 * (attempt + 1))
+        got = (data or {}).get("tasks") or []
+        for idx, t in enumerate(got):
+            if t.get("status_code") == 20100 and t.get("id") and idx < len(chunk):
+                pending[t["id"]] = chunk[idx][1]
+                stats["posted"] += 1
+                stats["cost"] = round(stats["cost"] + float(t.get("cost") or 0), 5)
+            else:
+                stats["post_errors"] += 1
+        if data is None:
+            stats["post_errors"] += len(chunk)
+        progress(stats)
+
+    sem = asyncio.Semaphore(25)
+
+    async def get_one(tid):
+        async with sem:
+            try:
+                async with s.get(get_url.format(tid)) as r:
+                    return tid, await r.json(content_type=None)
+            except Exception:
+                return tid, None
+
+    waited = 0
+    await asyncio.sleep(min(60, POLL_SECONDS))
+    while pending and waited < MAX_WAIT_SECONDS:
+        for tid, data in await asyncio.gather(*(get_one(t) for t in list(pending))):
+            t = ((data or {}).get("tasks") or [None])[0]
+            if not t:
+                continue
+            code = t.get("status_code")
+            if code == 20000:
+                key = pending.pop(tid)
+                stats["collected"] += 1
+                on_ready(key, t)
+            elif code in (40601, 40602):
+                continue  # still in queue / handed
+            else:
+                pending.pop(tid)
+                stats["failed"] += 1
+        stats["pending"] = len(pending)
+        progress(stats)
+        if pending:
+            await asyncio.sleep(POLL_SECONDS)
+            waited += POLL_SECONDS
+    stats["timed_out"] = len(pending)
+
+
+def _session():
     if not DFS_LOGIN:
         raise RuntimeError("DFS_LOGIN / DFS_PASSWORD are not set on the crawler")
-    headers = _auth_header()
-    timeout = aiohttp.ClientTimeout(total=60)
-    pending = {}  # task id -> search city
+    return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), headers=_auth_header())
+
+
+async def run_maps(tasks, depth, language_code, progress):
+    """Google Maps search for every task. Returns (rows deduped by CID, stats)."""
     stats = {"tasks": len(tasks), "posted": 0, "post_errors": 0, "collected": 0, "failed": 0, "items": 0, "ads_skipped": 0, "cost": 0.0}
     rows_by_cid = {}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
-        # 1) post in chunks of 100 (DataForSEO limit per call)
-        for i in range(0, len(tasks), 100):
-            chunk = tasks[i:i + 100]
-            body = [{"keyword": build_keyword(t), "location_code": 2840, "language_code": language_code,
-                     "depth": depth, "tag": str(t.get("city", ""))[:250]} for t in chunk]
-            for attempt in range(3):
-                try:
-                    async with s.post(f"{DFS_BASE}/task_post", json=body) as r:
-                        data = await r.json(content_type=None)
-                    break
-                except Exception:
-                    data = None
-                    await asyncio.sleep(3 * (attempt + 1))
-            for t in (data or {}).get("tasks") or []:
-                if t.get("status_code") == 20100 and t.get("id"):
-                    pending[t["id"]] = (t.get("data") or {}).get("tag", "")
-                    stats["posted"] += 1
-                    stats["cost"] += float(t.get("cost") or 0)
-                else:
-                    stats["post_errors"] += 1
-            if data is None:
-                stats["post_errors"] += len(chunk)
-            progress(stats)
 
-        # 2) poll task_get until everything is collected or we time out
-        waited = 0
-        sem = asyncio.Semaphore(25)
-
-        async def get_one(tid):
-            async with sem:
-                try:
-                    async with s.get(f"{DFS_BASE}/task_get/advanced/{tid}") as r:
-                        return tid, await r.json(content_type=None)
-                except Exception:
-                    return tid, None
-
-        await asyncio.sleep(min(60, POLL_SECONDS))
-        while pending and waited < MAX_WAIT_SECONDS:
-            results = await asyncio.gather(*(get_one(t) for t in list(pending)))
-            for tid, data in results:
-                t = ((data or {}).get("tasks") or [None])[0]
-                if not t:
+    def on_ready(city, t):
+        for res in t.get("result") or []:
+            for it in res.get("items") or []:
+                if it.get("type") != "maps_search":
+                    stats["ads_skipped"] += 1
                     continue
-                code = t.get("status_code")
-                if code == 20000:
-                    city = pending.pop(tid)
-                    stats["collected"] += 1
-                    for res in t.get("result") or []:
-                        for it in res.get("items") or []:
-                            if it.get("type") != "maps_search":
-                                stats["ads_skipped"] += 1
-                                continue
-                            stats["items"] += 1
-                            row = slim(it, city)
-                            key = row["CID"] or (row["NAME"] + "|" + row["FULL ADDRESS"])
-                            rows_by_cid.setdefault(key, row)
-                elif code in (40601, 40602):
-                    continue  # still in queue / handed to the crawler
-                else:
-                    pending.pop(tid)
-                    stats["failed"] += 1
-            stats["pending"] = len(pending)
-            progress(stats)
-            if pending:
-                await asyncio.sleep(POLL_SECONDS)
-                waited += POLL_SECONDS
-        stats["timed_out"] = len(pending)
+                stats["items"] += 1
+                row = slim(it, city)
+                rows_by_cid.setdefault(row["CID"] or (row["NAME"] + "|" + row["FULL ADDRESS"]), row)
+
+    bodies = [({"keyword": build_keyword(t), "location_code": 2840, "language_code": language_code,
+                "depth": depth, "tag": str(t.get("city", ""))[:250]}, str(t.get("city", ""))) for t in tasks]
+    async with _session() as s:
+        await _post_and_collect(s, f"{DFS_BASE}/task_post", DFS_BASE + "/task_get/advanced/{}", bodies, on_ready, stats, progress)
     stats["unique_places"] = len(rows_by_cid)
     return list(rows_by_cid.values()), stats
+
+
+def _review_images(it):
+    imgs = it.get("images") or []
+    urls = []
+    for im in imgs:
+        if isinstance(im, dict):
+            u = im.get("image_url") or im.get("url") or ""
+        else:
+            u = str(im)
+        if u:
+            urls.append(u)
+    return ", ".join(urls)
+
+
+async def run_reviews(cids, depth, keep, max_rating, language_code, progress):
+    """Lowest-rated reviews per CID. Keeps up to `keep` reviews with rating <= max_rating
+    (reviews with text first). Returns (review rows, stats)."""
+    stats = {"businesses": len(cids), "posted": 0, "post_errors": 0, "collected": 0, "failed": 0,
+             "reviews_seen": 0, "kept": 0, "businesses_with_kept": 0, "cost": 0.0}
+    out = []
+
+    def on_ready(cid, t):
+        picked = []
+        for res in t.get("result") or []:
+            for it in res.get("items") or []:
+                stats["reviews_seen"] += 1
+                val = (it.get("rating") or {}).get("value")
+                try:
+                    val = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if val > max_rating:
+                    continue
+                text = (it.get("review_text") or it.get("original_review_text") or "").strip()
+                picked.append({"CID": cid, "SCORE": int(val) if val == int(val) else val, "TEXT": text,
+                               "PICTURES": _review_images(it), "USER NAME": it.get("profile_name") or "",
+                               "REVIEW DATE": it.get("timestamp") or "", "REVIEW URL": it.get("review_url") or ""})
+        picked.sort(key=lambda r: 0 if r["TEXT"] else 1)  # stable: keeps DataForSEO's lowest-first order
+        picked = picked[:keep]
+        if picked:
+            stats["businesses_with_kept"] += 1
+            stats["kept"] += len(picked)
+            out.extend(picked)
+
+    bodies = [({"cid": c, "location_code": 2840, "language_code": language_code, "depth": depth,
+                "sort_by": "lowest_rating", "tag": c}, c) for c in cids]
+    async with _session() as s:
+        await _post_and_collect(s, f"{DFS_REVIEWS_BASE}/task_post", DFS_REVIEWS_BASE + "/task_get/{}", bodies, on_ready, stats, progress)
+    return out, stats

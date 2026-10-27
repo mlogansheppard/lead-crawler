@@ -116,12 +116,29 @@ def test_maps_job(monkeypatch):
                 items.append({"type": "maps_search", "title": "No Site Co", "cid": "222", "address": "", "category": "Plumber"})
             return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": items}]}]})
 
+        rposted = []
+
+        async def r_task_post(r):
+            body = await r.json()
+            rposted.extend(body)
+            return web.json_response({"tasks": [{"id": f"r{i}", "status_code": 20100, "cost": 0.00075} for i, b in enumerate(body)]})
+
+        async def r_task_get(r):
+            items = [{"rating": {"value": 1}, "review_text": "", "profile_name": "NoText"}]
+            items += [{"rating": {"value": 1}, "review_text": f"bad {i}", "profile_name": f"U{i}",
+                       "images": [{"image_url": f"https://img/{i}.jpg", "url": "x"}] if i == 0 else None} for i in range(7)]
+            items += [{"rating": {"value": 2}, "review_text": "meh", "profile_name": "Two"}]
+            return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": items}]}]})
+
         dfs = web.Application()
+        dfs.router.add_post("/r/task_post", r_task_post)
+        dfs.router.add_get("/r/task_get/{tid}", r_task_get)
         dfs.router.add_post("/task_post", task_post)
         dfs.router.add_get("/task_get/advanced/{tid}", task_get)
         dfs_srv = TestServer(dfs)
         await dfs_srv.start_server()
         monkeypatch.setattr(server.maps, "DFS_BASE", f"http://127.0.0.1:{dfs_srv.port}")
+        monkeypatch.setattr(server.maps, "DFS_REVIEWS_BASE", f"http://127.0.0.1:{dfs_srv.port}/r")
         monkeypatch.setattr(server.maps, "DFS_LOGIN", "x")
         monkeypatch.setattr(server.maps, "POLL_SECONDS", 0)
         monkeypatch.setattr(server.maps.asyncio, "sleep", _fast_sleep)
@@ -133,12 +150,13 @@ def test_maps_job(monkeypatch):
         jid = (await r.json())["job_id"]
         j = await _wait(client, jid)
         text = await (await client.get(f"/jobs/{jid}/csv")).text()
+        rtext = await (await client.get(f"/jobs/{jid}/reviews.csv")).text()
         await client.close()
         await site.close()
         await dfs_srv.close()
-        return posted, j, text
+        return posted, j, text, rposted, rtext
 
-    posted, j, text = asyncio.run(run())
+    posted, j, text, rposted, rtext = asyncio.run(run())
     assert posted[0]["keyword"] == "plumber in Austin, TX 78701" and posted[0]["depth"] == 200
     assert j["status"] == "done", j
     rows = list(csv.DictReader(io.StringIO(text)))
@@ -148,6 +166,12 @@ def test_maps_job(monkeypatch):
     assert acme["URL"] == "https://maps.google.com/?cid=111"
     assert acme["CATEGORY"] == "Plumber, Drainage service"
     assert j["stats"]["maps"]["ads_skipped"] == 2
+    # reviews: only the business with an email, sorted lowest, 5 kept, 1-star only, text first
+    assert len(rposted) == 1 and rposted[0]["cid"] == "111" and rposted[0]["sort_by"] == "lowest_rating"
+    revs = list(csv.DictReader(io.StringIO(rtext)))
+    assert len(revs) == 5 and all(r["SCORE"] == "1" and r["TEXT"] for r in revs), revs
+    assert revs[0]["TEXT"] == "bad 0" and revs[0]["PICTURES"] == "https://img/0.jpg"
+    assert j["review_rows"] == 5
 
 
 _real_sleep = asyncio.sleep
