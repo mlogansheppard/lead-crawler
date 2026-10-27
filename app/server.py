@@ -317,7 +317,8 @@ async def _run_pool(session, sites, max_pages, on_done, sem, concurrency, result
         try:
             r = await crawl_site(session, s, max_pages, sem)
         except Exception as e:  # one bad site never kills the job
-            r = {"id": s.get("id", ""), "url": s.get("url", ""), "emails": [], "facebook": "", "pages": 0, "error": str(e)[:200]}
+            r = {"id": s.get("id", ""), "url": s.get("url", ""), "emails": [], "facebook": "", "pages": 0,
+                 "error": "bad_url" if isinstance(e, ValueError) else "crashed: " + str(e)[:150]}
         results.append(r)
         if on_done:
             on_done(r)
@@ -428,6 +429,7 @@ async def run_email_job(job):
 AGENCY_MIN_SITES = int(os.environ.get("AGENCY_MIN_SITES", "3"))
 RETRY_CONCURRENCY = int(os.environ.get("RETRY_CONCURRENCY", "25"))
 RETRY_TIMEOUT = float(os.environ.get("RETRY_TIMEOUT", "25"))
+RETRY_MIN_SHARE = float(os.environ.get("RETRY_MIN_SHARE", "0.2"))
 
 
 def _blocker_counts(done):
@@ -452,7 +454,8 @@ async def clean_job_emails(done):
     """Job-wide cleanup after crawling (also re-applies the current rules to results crawled by older code):
     1. clean + dedupe every address
     2. an address, or a non-free domain that isn't the site's own, showing up on AGENCY_MIN_SITES+ different
-       websites is a web-design agency / theme / template footer, not the business: drop it
+       websites is a web-design agency / theme / template footer, not the business: drop it (an address on the
+       site's own domain is always kept: that's a chain or multi-location business, not an agency)
     3. drop emails whose domain can't receive mail (no MX and no A record), so MillionVerifier credits aren't wasted
     4. re-rank (personal > role > free > low > other; other-domain only kept when nothing better exists)"""
     from extract import clean_email
@@ -482,7 +485,8 @@ async def clean_job_emails(done):
         keep = []
         for e in res["emails"]:
             dom = e.split("@")[1]
-            if e in agency_emails or (registrable(dom) in agency_domains and registrable(dom) != site_reg):
+            own = registrable(dom) == site_reg
+            if (e in agency_emails and not own) or (registrable(dom) in agency_domains and not own):
                 dropped["agency_or_template"] += 1
                 continue
             if dom in dead:
@@ -578,6 +582,12 @@ async def run_maps_job(job):
         # busy moments on the VPS or a slow host shouldn't cost us the email
         retry = [{"id": k, "url": by_site[k]["url"], "contact_url": by_site[k]["contact_url"]}
                  for k, v in done.items() if k in by_site and v.get("error") in RETRYABLE]
+        # Normally ~11% of sites fail on the network because they're dead or very slow, and retrying them
+        # recovered ~1% for ~40 minutes of waiting. Only retry when failures are well above normal, which
+        # means the problem was on our side (e.g. DNS overload) and a second pass is worth it.
+        if retry and len(retry) < RETRY_MIN_SHARE * max(len(done), 1):
+            est["retry_skipped"] = len(retry)
+            retry = []
         if retry:
             job["phase"] = "emails (retrying failed sites)"
             est["retrying"] = len(retry)

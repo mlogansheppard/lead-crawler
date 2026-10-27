@@ -844,3 +844,27 @@ def test_blocked_rules_and_challenge_pages():
     assert server._blocker({"Server": "cloudflare"}) == "cloudflare" and server._blocker({"X-Sucuri-ID": "1"}) == "sucuri"
     assert server._is_challenge("<html><head><title>Just a moment...</title></head><body>cloudflare</body></html>")
     assert not server._is_challenge("<html><title>Acme Plumbing</title> email us</html>")
+
+
+def test_chain_and_isp_mailboxes_are_not_agencies(monkeypatch):
+    async def no_dead(domains):
+        return set()
+    monkeypatch.setattr(server.mxcheck, "dead_domains", no_dead)
+    done = {
+        # a chain: same own-domain address on every location page
+        "bigplumb.com/locations/a": {"emails": ["info@bigplumb.com"], "types": ["role"], "facebook": ""},
+        "bigplumb.com/locations/b": {"emails": ["info@bigplumb.com"], "types": ["role"], "facebook": ""},
+        "bigplumb.com/locations/c": {"emails": ["info@bigplumb.com"], "types": ["role"], "facebook": ""},
+        # three unrelated owners on Spectrum (rr.com) mailboxes
+        "joesroof.com": {"emails": ["joe@rr.com"], "types": ["other"], "facebook": ""},
+        "annsroof.com": {"emails": ["ann@rr.com"], "types": ["other"], "facebook": ""},
+        "bobsroof.com": {"emails": ["bob@rr.com"], "types": ["other"], "facebook": ""},
+        # a template placeholder on three sites is still dropped
+        "x1.com": {"emails": ["info@your-company.com"], "types": ["other"], "facebook": ""},
+        "x2.com": {"emails": ["info@your-company.com"], "types": ["other"], "facebook": ""},
+        "x3.com": {"emails": ["info@your-company.com"], "types": ["other"], "facebook": ""},
+    }
+    asyncio.run(server.clean_job_emails(done))
+    assert all(done[f"bigplumb.com/locations/{x}"]["emails"] == ["info@bigplumb.com"] for x in "abc")
+    assert done["joesroof.com"]["emails"] == ["joe@rr.com"] and done["joesroof.com"]["types"] == ["free"]
+    assert all(done[f"x{i}.com"]["emails"] == [] for i in (1, 2, 3))

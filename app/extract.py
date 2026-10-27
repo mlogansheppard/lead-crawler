@@ -57,7 +57,17 @@ ROLE_GOOD = {
     "quote", "dispatch", "general", "main", "questions", "ask", "connect", "staff", "clinic", "studio", "shop",
     "store", "orders-info", "request", "requests", "leads", "newpatients", "patients",
 }
-FREE_PROVIDERS = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "aol.com", "icloud.com", "live.com", "msn.com", "comcast.net", "att.net", "sbcglobal.net", "verizon.net", "bellsouth.net", "me.com", "protonmail.com", "ymail.com", "cox.net", "charter.net", "rocketmail.com", "mac.com", "earthlink.net", "frontier.com", "windstream.net", "centurylink.net", "optonline.net", "roadrunner.com", "twc.com", "q.com", "gmx.com", "zoho.com", "aim.com", "juno.com", "netzero.net", "mail.com"}
+FREE_PROVIDERS = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "aol.com", "icloud.com", "live.com", "msn.com", "comcast.net", "att.net", "sbcglobal.net", "verizon.net", "bellsouth.net", "me.com", "protonmail.com", "ymail.com", "cox.net", "charter.net", "rocketmail.com", "mac.com", "earthlink.net", "frontier.com", "windstream.net", "centurylink.net", "optonline.net", "roadrunner.com", "twc.com", "q.com", "gmx.com", "zoho.com", "aim.com", "juno.com", "netzero.net", "mail.com",
+                  # internet-provider and legacy mailboxes small business owners still use
+                  "rr.com", "frontiernet.net", "myyahoo.com", "embarqmail.com", "centurytel.net", "windstream.com",
+                  "suddenlink.net", "mediacombb.net", "tds.net", "hughes.net", "wildblue.net", "ptd.net", "epix.net",
+                  "atlanticbb.net", "metrocast.net", "cfl.rr.com", "tampabay.rr.com", "nc.rr.com", "sc.rr.com",
+                  "austin.rr.com", "satx.rr.com", "kc.rr.com", "woh.rr.com", "neo.rr.com", "nycap.rr.com",
+                  "twcny.rr.com", "triad.rr.com", "hawaii.rr.com", "ec.rr.com", "aol.net", "pacbell.net",
+                  "swbell.net", "ameritech.net", "flash.net", "prodigy.net", "snet.net", "wavecable.com",
+                  "knology.net", "grandecom.net", "consolidated.net", "fairpoint.net", "gci.net", "mchsi.com",
+                  "outlook.us", "hotmail.us", "live.us", "msn.us", "proton.me", "pm.me", "fastmail.com",
+                  "yahoo.co", "aol.co", "icloud.co"}
 
 SKIP_SITE_DOMAINS = (
     "facebook.com", "instagram.com", "yelp.com", "linktr.ee", "google.com", "business.site", "g.page",
