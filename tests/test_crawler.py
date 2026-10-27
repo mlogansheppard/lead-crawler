@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import re
 import io
 import os
 import sys
@@ -269,3 +270,11 @@ def test_pause_on_no_balance_then_resume_after_restart(monkeypatch, tmp_path):
     assert len(rows) == 150 and all(r["EMAIL"] == "owner@gmail.com" for r in rows)
     assert all(b["sort_by"] == "lowest_rating" for b in reviews_posted) and len(reviews_posted) == 150
     assert len(list(csv.DictReader(io.StringIO(rtext)))) == 150
+
+
+def test_locations():
+    cities, code = server.state_cities("Texas")
+    assert code == "TX" and len(cities) > 1500
+    assert any(c.startswith("Austin 787") for c in cities)
+    assert all(re.match(r"^.+ \d{5}$", c) for c in cities)
+    assert server.state_cities("new york")[1] == "NY"

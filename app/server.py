@@ -17,6 +17,7 @@ All requests need header  X-API-Key: <API_KEY env>.
   Maps jobs also take "reviews": {"enabled": true, "depth": 20, "keep": 5, "max_rating": 1}
   (DataForSEO reviews sorted lowest_rating; keeps up to `keep` reviews rated <= max_rating, ones with text first).
   POST /jobs/{id}/resume        -> continue a paused job now (paused jobs also retry by themselves every 10 min)
+  GET  /locations?state=Texas    -> {"cities": ["Austin 78701", ...]}  every active standard ZIP in the state
   GET  /health
 
   Maps jobs are saved to DATA_DIR. If DataForSEO rejects the key / runs out of balance / is unreachable, the job
@@ -438,6 +439,39 @@ async def job_output(request):
                         headers={"Content-Disposition": f"attachment; filename={'reviews' if want_reviews else 'maps'}.csv"})
 
 
+STATE_NAMES = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA", "Colorado": "CO",
+    "Connecticut": "CT", "Delaware": "DE", "District of Columbia": "DC", "Florida": "FL", "Georgia": "GA",
+    "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD", "Massachusetts": "MA",
+    "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS", "Missouri": "MO", "Montana": "MT",
+    "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM",
+    "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC", "South Dakota": "SD",
+    "Tennessee": "TN", "Texas": "TX", "Utah": "UT", "Vermont": "VT", "Virginia": "VA", "Washington": "WA",
+    "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
+}
+_ZIPS = None
+
+
+def state_cities(state):
+    """Every active standard (street-delivery) ZIP in a state as "City 12345", the same format lobstr used."""
+    global _ZIPS
+    if _ZIPS is None:
+        import zipcodes
+        _ZIPS = [z for z in zipcodes.list_all() if z["zip_code_type"] == "STANDARD" and z["active"]]
+    st = str(state or "").strip()
+    code = STATE_NAMES.get(st) or next((v for k, v in STATE_NAMES.items() if k.lower() == st.lower()), st.upper())
+    return sorted({f"{z['city'].title()} {z['zip_code']}" for z in _ZIPS if z["state"] == code}), code
+
+
+async def locations(request):
+    if not authed(request):
+        return deny()
+    cities, code = state_cities(request.query.get("state", ""))
+    return web.json_response({"state": request.query.get("state", ""), "state_code": code, "count": len(cities), "cities": cities})
+
+
 async def health(_):
     paused = [j["id"] for j in JOBS.values() if j["status"] == "paused"]
     return web.json_response({"ok": True, "jobs": len(JOBS), "running": len(RUNNING), "paused": paused,
@@ -478,6 +512,7 @@ def make_app():
     app.router.add_post("/jobs/{job_id}/resume", resume_job)
     app.router.add_get("/jobs/{job_id}/csv", job_output)
     app.router.add_get("/jobs/{job_id}/{what:reviews}.csv", job_output)
+    app.router.add_get("/locations", locations)
     app.router.add_get("/health", health)
     app.cleanup_ctx.append(background)
     return app

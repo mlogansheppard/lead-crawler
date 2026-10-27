@@ -1,1 +1,2 @@
 aiohttp==3.14.5
+zipcodes==3.0.0
