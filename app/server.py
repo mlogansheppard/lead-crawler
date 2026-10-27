@@ -222,10 +222,21 @@ AGENCY_MIN_SITES = int(os.environ.get("AGENCY_MIN_SITES", "3"))
 
 
 async def clean_job_emails(done):
-    """Job-wide cleanup after crawling:
-    - an address, or a non-free domain that isn't the site's own, showing up on AGENCY_MIN_SITES+ different
-      websites is a web-design agency / theme / template footer, not the business: drop it
-    - drop emails whose domain can't receive mail (no MX and no A record), so MillionVerifier credits aren't wasted"""
+    """Job-wide cleanup after crawling (also re-applies the current rules to results crawled by older code):
+    1. clean + dedupe every address
+    2. an address, or a non-free domain that isn't the site's own, showing up on AGENCY_MIN_SITES+ different
+       websites is a web-design agency / theme / template footer, not the business: drop it
+    3. drop emails whose domain can't receive mail (no MX and no A record), so MillionVerifier credits aren't wasted
+    4. re-rank (personal > role > free > low > other; other-domain only kept when nothing better exists)"""
+    from extract import clean_email
+    for res in done.values():
+        seen, cleaned = set(), []
+        for e in res["emails"]:
+            c = clean_email(e)
+            if c and c not in seen:
+                seen.add(c)
+                cleaned.append(c)
+        res["emails"] = cleaned
     by_email, by_domain = {}, {}
     for site, res in done.items():
         site_reg = site.split("/")[0]
@@ -241,8 +252,8 @@ async def clean_job_emails(done):
     dropped = {"agency_or_template": 0, "dead_domain": 0}
     for site, res in done.items():
         site_reg = site.split("/")[0]
-        keep_e, keep_t = [], []
-        for e, t in zip(res["emails"], res.get("types") or ["role"] * len(res["emails"])):
+        keep = []
+        for e in res["emails"]:
             dom = e.split("@")[1]
             if e in agency_emails or (registrable(dom) in agency_domains and registrable(dom) != site_reg):
                 dropped["agency_or_template"] += 1
@@ -250,11 +261,23 @@ async def clean_job_emails(done):
             if dom in dead:
                 dropped["dead_domain"] += 1
                 continue
-            keep_e.append(e)
-            keep_t.append(t)
-        res["emails"], res["types"] = keep_e, keep_t
+            keep.append(e)
+        typed = rank_emails_typed(keep, "http://" + site_reg)
+        res["emails"], res["types"] = [e for e, _ in typed], [t for _, t in typed]
     dropped["agency_domains"] = sorted(agency_domains)[:50]
     return dropped
+
+
+def _legacy_site_key(url):
+    """Site key as older versions computed it (hosted subdomains collapsed), so jobs crawled before an
+    upgrade still match their saved results."""
+    home = normalize_site(url)
+    if not home:
+        return ""
+    u = urlparse(home)
+    parts = (u.hostname or "").lower().removeprefix("www.").split(".")
+    reg = ".".join(parts[-3:]) if len(parts) >= 3 and len(parts[-2]) <= 3 and len(parts[-1]) == 2 else ".".join(parts[-2:])
+    return reg + u.path.rstrip("/")
 
 
 def _site_key(url):
@@ -312,7 +335,7 @@ async def run_maps_job(job):
 
     done = job.get("crawl_results", {})
     for r in rows:
-        res = done.get(_site_key(r["WEBSITE"]))
+        res = done.get(_site_key(r["WEBSITE"])) or done.get(_legacy_site_key(r["WEBSITE"]))
         r["EMAIL"] = ", ".join(res["emails"]) if res else ""
         r["EMAIL TYPES"] = ", ".join(res.get("types", [])) if res else ""
         r["FACEBOOK"] = res["facebook"] if res else ""

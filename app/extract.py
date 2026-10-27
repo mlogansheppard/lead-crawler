@@ -27,7 +27,7 @@ BAD_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".c
 BAD_DOMAINS = {
     "example.com", "example.org", "domain.com", "email.com", "yourdomain.com", "yoursite.com", "company.com",
     "sentry.io", "sentry.wixpress.com", "sentry-next.wixpress.com", "wixpress.com", "wix.com", "godaddy.com",
-    "squarespace.com", "mysite.com", "website.com", "test.com", "address.com", "sample.com", "yourcompany.com",
+    "mysite.com", "website.com", "test.com", "address.com", "sample.com", "yourcompany.com",
     "yourbusiness.com", "businessname.com", "yourwebsite.com", "emailaddress.com", "site.com", "domainname.com",
     "schema.org", "w3.org", "googlemail.co", "latofonts.com", "typemade.mx", "indiantypefoundry.com",
 }
@@ -74,10 +74,31 @@ def decode_cfemail(hexstr: str) -> str:
         return ""
 
 
+# free/hosted website builders: every subdomain is a different business
+HOSTED_SUFFIXES = (
+    "square.site", "wixsite.com", "godaddysites.com", "weebly.com", "wordpress.com", "squarespace.com",
+    "myshopify.com", "carrd.co", "webflow.io", "netlify.app", "vercel.app", "github.io", "blogspot.com",
+    "site123.me", "mystrikingly.com", "strikingly.com", "jimdosite.com", "jimdofree.com", "ueniweb.com",
+    "business.site", "mozellosite.com", "webnode.com", "yolasite.com", "simplesite.com", "wix.com",
+    "glossgenius.com", "square.online", "editorx.io", "framer.website", "durablesites.com", "durable.co",
+)
+# booking / directory platforms: an address at their domain belongs to the platform, not the business
+PLATFORM_EMAIL_DOMAINS = {
+    "vagaro.com", "glossgenius.com", "squareup.com", "square.site", "booksy.com", "schedulicity.com", "mindbodyonline.com",
+    "mindbody.io", "setmore.com", "acuityscheduling.com", "fresha.com", "styleseat.com", "boulevard.io", "zenoti.com",
+    "janeapp.com", "aestheticsrecord.com", "moxiemedspa.com", "patientnow.com", "calendly.com", "wix.com",
+    "godaddy.com", "weebly.com", "squarespace.com", "shopify.com", "yelp.com", "google.com", "ueni.com",
+    "durable.co", "hibu.com", "thryv.com", "yodle.com", "scorpion.co", "birdeye.com", "podium.com",
+}
+
+
 def registrable(host: str) -> str:
     host = (host or "").lower().split(":")[0]
     if host.startswith("www."):
         host = host[4:]
+    for suf in HOSTED_SUFFIXES:
+        if host.endswith("." + suf) and host != suf:
+            return host  # e.g. glowmedspa.square.site
     parts = host.split(".")
     # crude eTLD+1, good enough for US small-business sites (handles co.uk style too)
     if len(parts) >= 3 and len(parts[-2]) <= 3 and len(parts[-1]) == 2:
@@ -104,7 +125,7 @@ def normalize_site(url: str) -> str:
 
 
 def clean_email(e: str) -> str:
-    e = html.unescape(e or "").strip().strip(".,;:()[]<>\"'").lower()
+    e = html.unescape(e or "").replace("\\", "").strip().strip(".,;:()[]<>\"'").lower()
     e = re.sub(r"^(?:%20|u003e|mailto:)+", "", e)
     if e.count("@") != 1 or len(e) > 100:
         return ""
@@ -114,6 +135,8 @@ def clean_email(e: str) -> str:
     if dom.endswith(BAD_EXT) or e.endswith(BAD_EXT) or re.search(r"@\d+x\.", e):
         return ""
     if dom in BAD_DOMAINS or dom.endswith(BAD_DOMAIN_SUFFIXES):
+        return ""
+    if dom in PLATFORM_EMAIL_DOMAINS or any(dom.endswith("." + d) for d in PLATFORM_EMAIL_DOMAINS):
         return ""
     if BAD_LOCAL.match(local) or HEXHASH_LOCAL.match(local):
         return ""
@@ -254,6 +277,10 @@ def rank_emails_typed(emails: list, site_url: str) -> list:
     (acmeplumbing@gmail.com), same-domain billing/marketing style inboxes, then other domains."""
     typed = [(e, email_type(e, site_url)) for e in emails]
     typed = [t for t in typed if t[1] != "drop"]
+    # an address on some other domain is usually the web designer or an old domain: only keep those
+    # when the site gave us nothing at its own domain or a free provider
+    if any(t[1] != "other" for t in typed):
+        typed = [t for t in typed if t[1] != "other"]
     return sorted(typed, key=lambda t: TYPE_ORDER[t[1]])
 
 

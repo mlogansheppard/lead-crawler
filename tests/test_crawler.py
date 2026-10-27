@@ -36,7 +36,7 @@ def test_extract_variants():
 
 def test_rank_and_normalize():
     ranked = extract.rank_emails(["x@agency.com", "a@gmail.com", "b@acme.com"], "https://www.acme.com/")
-    assert ranked == ["b@acme.com", "a@gmail.com", "x@agency.com"]
+    assert ranked == ["b@acme.com", "a@gmail.com"]  # other-domain dropped when better ones exist
     assert extract.normalize_site("facebook.com/acme") == ""
     assert extract.normalize_site("acme.com") == "http://acme.com/"
     assert extract.normalize_site("https://WWW.Acme.com/home") == "https://www.acme.com/home"
@@ -403,7 +403,7 @@ def test_email_ranking_and_role_drops():
               "careers@acme.com", "privacy@acme.com", "john.smith@acme.com", "webmaster@acme.com"]
     typed = extract.rank_emails_typed(emails, "https://www.acme.com/")
     assert typed == [("john.smith@acme.com", "personal"), ("info@acme.com", "role"), ("acmeplumb@gmail.com", "free"),
-                     ("billing@acme.com", "low"), ("support@agencyweb.com", "other")], typed
+                     ("billing@acme.com", "low")], typed
 
 
 def test_sitemap_links():
@@ -452,3 +452,29 @@ def test_agency_and_dead_domain_filter(monkeypatch):
     assert done["a.com"]["emails"] == ["info@a.com"] and done["b.com"]["emails"] == ["bob@b.com"]
     assert done["c.com"]["emails"] == [] and done["deadshop.com"]["emails"] == ["deadshop@gmail.com"]
     assert stats["agency_or_template"] == 3 and stats["dead_domain"] == 1 and stats["agency_domains"] == ["pixelagency.com"]
+
+
+def test_real_run_fixes():
+    # escaped JSON leftovers are cleaned and deduped
+    assert extract.clean_email("info@oramedicalspa.com\\") == "info@oramedicalspa.com"
+    assert extract.extract_emails('<script>{"e":"hello@skinclinic.com\\"}</script><a href="mailto:hello@skinclinic.com">x</a>') == ["hello@skinclinic.com"]
+    # every Square/Wix/GoDaddy subdomain is its own business
+    assert extract.registrable("glowmedspa.square.site") == "glowmedspa.square.site"
+    assert extract.registrable("www.lashbar.wixsite.com") == "lashbar.wixsite.com"
+    assert extract.registrable("shop.acme.com") == "acme.com"
+    # booking platform addresses are not the business's email
+    assert extract.clean_email("support@vagaro.com") == "" and extract.clean_email("help@glossgenius.com") == ""
+    # other-domain addresses only survive when nothing better exists
+    typed = extract.rank_emails_typed(["susan.bruno@coastalcontours.com", "hello@alan-lang.com"], "https://coastalcontours.com/")
+    assert typed == [("susan.bruno@coastalcontours.com", "personal")]
+    assert extract.rank_emails_typed(["hello@alan-lang.com"], "https://coastalcontours.com/") == [("hello@alan-lang.com", "other")]
+
+
+def test_job_cleanup_fixes_old_results(monkeypatch):
+    async def none(domains):
+        return set()
+    monkeypatch.setattr(server.mxcheck, "dead_domains", none)
+    done = {"oramedicalspa.com": {"emails": ["info@oramedicalspa.com", "info@oramedicalspa.com\\", "hi@designer.com"],
+                                  "types": ["role", "role", "other"], "facebook": ""}}
+    asyncio.run(server.clean_job_emails(done))
+    assert done["oramedicalspa.com"]["emails"] == ["info@oramedicalspa.com"] and done["oramedicalspa.com"]["types"] == ["role"]
