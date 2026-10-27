@@ -180,6 +180,9 @@ async def run_reviews(cids, depth, keep, max_rating, language_code, progress):
     out = []
 
     def on_ready(cid, t):
+        # DataForSEO echoes the task settings back; flag any task that wasn't sorted lowest-first
+        if ((t.get("data") or {}).get("sort_by") or "lowest_rating") != "lowest_rating":
+            stats["not_lowest_first"] = stats.get("not_lowest_first", 0) + 1
         picked = []
         for res in t.get("result") or []:
             for it in res.get("items") or []:
@@ -195,7 +198,9 @@ async def run_reviews(cids, depth, keep, max_rating, language_code, progress):
                 picked.append({"CID": cid, "SCORE": int(val) if val == int(val) else val, "TEXT": text,
                                "PICTURES": _review_images(it), "USER NAME": it.get("profile_name") or "",
                                "REVIEW DATE": it.get("timestamp") or "", "REVIEW URL": it.get("review_url") or ""})
-        picked.sort(key=lambda r: 0 if r["TEXT"] else 1)  # stable: keeps DataForSEO's lowest-first order
+        # lowest rating first (belt and braces on top of sort_by=lowest_rating), then reviews with text;
+        # the sort is stable so DataForSEO's own order is kept inside each group
+        picked.sort(key=lambda r: (r["SCORE"], 0 if r["TEXT"] else 1))
         picked = picked[:keep]
         if picked:
             stats["businesses_with_kept"] += 1
