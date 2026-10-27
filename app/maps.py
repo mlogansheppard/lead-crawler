@@ -265,3 +265,69 @@ async def run_reviews_stage(state, out, keep, max_rating, save):
     async with session() as s:
         await run_stage(s, f"{DFS_REVIEWS_BASE}/task_post", DFS_REVIEWS_BASE + "/task_get/{}", state,
                         reviews_on_ready(out, state["stats"], keep, max_rating), save)
+
+
+# ---------------------------------------------------------------- adaptive search plan
+# Start with one search per county. Any search that comes back "full" (>= split_at places) is split into
+# its cities, and any full city into its ZIPs. Sparse areas cost one search; dense metros still get every ZIP.
+
+def build_plan(state_codes, category, test_limit=0):
+    """Returns {"nodes": {id: {"kw", "label", "children"}}, "roots": [ids]} for the given states."""
+    import zipcodes
+    zips = [z for z in zipcodes.list_all() if z["zip_code_type"] == "STANDARD" and z["active"]]
+    cat = category.strip()
+    nodes, roots = {}, []
+    for st in state_codes:
+        counties = {}
+        for z in zips:
+            if z["state"] != st:
+                continue
+            county = z["county"] or z["city"].title()
+            counties.setdefault(county, {}).setdefault(z["city"].title(), []).append(z["zip_code"])
+        names = sorted(counties)
+        if test_limit and test_limit > 0:
+            names = names[:test_limit]
+        for county in names:
+            cities = counties[county]
+            city_ids = []
+            for city in sorted(cities):
+                zip_ids = []
+                for zc in sorted(cities[city]):
+                    zid = f"z:{st}:{zc}"
+                    nodes[zid] = {"kw": f"{cat} in {city}, {st} {zc}", "label": f"{city} {zc}", "children": []}
+                    zip_ids.append(zid)
+                if len(zip_ids) == 1:
+                    city_ids.append(zip_ids[0])  # one-ZIP town: the ZIP search is the city search
+                else:
+                    cid = f"c:{st}:{county}:{city}"
+                    nodes[cid] = {"kw": f"{cat} in {city}, {st}", "label": f"{city}, {st}", "children": zip_ids}
+                    city_ids.append(cid)
+            if len(city_ids) == 1:
+                roots.append(city_ids[0])  # one-city county: start at the city
+            else:
+                kid = f"k:{st}:{county}"
+                nodes[kid] = {"kw": f"{cat} in {county}, {st}", "label": f"{county}, {st}", "children": city_ids}
+                roots.append(kid)
+    return {"nodes": nodes, "roots": roots}
+
+
+def plan_round_tasks(plan, frontier, depth, language_code):
+    return [({"keyword": plan["nodes"][nid]["kw"], "location_code": 2840, "language_code": language_code,
+              "depth": depth, "tag": nid[:250]}, nid) for nid in frontier]
+
+
+def adaptive_on_ready(plan, rows_by_cid, counts, stats):
+    def on_ready(nid, t):
+        n = 0
+        label = plan["nodes"][nid]["label"]
+        for res in t.get("result") or []:
+            for it in res.get("items") or []:
+                if it.get("type") != "maps_search":
+                    stats["ads_skipped"] = stats.get("ads_skipped", 0) + 1
+                    continue
+                n += 1
+                stats["items"] = stats.get("items", 0) + 1
+                row = slim(it, label)
+                rows_by_cid.setdefault(row["CID"] or (row["NAME"] + "|" + row["FULL ADDRESS"]), row)
+        counts[nid] = n
+    return on_ready

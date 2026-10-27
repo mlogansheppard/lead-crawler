@@ -2,10 +2,12 @@
 
 All requests need header  X-API-Key: <API_KEY env>.
 
-  POST /maps-jobs   {"tasks": [{"city": "Austin 78701", "category": "plumber", "state_code": "TX"}],
+  POST /maps-jobs   {"strategy": "adaptive", "category": "plumber", "states": ["TX", "GA"], "split_at": 100,
                      "depth": 200, "max_pages": 10}
-                    -> {"job_id": "...", "tasks": N}
-                    Runs DataForSEO Maps for every task, dedupes by CID, then crawls each website for emails.
+                    Adaptive: one search per county; a search that returns >= split_at places is split into
+                    its cities, a full city into its ZIPs. Sparse areas = 1 search, dense metros = every ZIP.
+                    (or "strategy": "zip" with "tasks": [{"city": "Austin 78701", "category": ..., "state_code": "TX"}])
+                    Then dedupes by CID, crawls each website for emails and pulls 1-star reviews.
 
   POST /jobs        {"sites": [{"id": "<anything>", "url": "https://..."}], "max_pages": 10}
                     -> {"job_id": "..."}   (emails only, for websites you already have)
@@ -215,10 +217,13 @@ async def run_maps_job(job):
     # 1) DataForSEO Maps
     if not job.get("maps_done"):
         job["phase"] = "maps"
-        if "maps_state" not in job:
-            job["maps_state"] = maps.new_stage(maps.maps_tasks(p["tasks"], p["depth"], p["language_code"]))
-            job["maps_rows"] = {}
-        await maps.run_maps_stage(job["maps_state"], job["maps_rows"], save)
+        if p.get("strategy") == "adaptive":
+            await run_adaptive_maps(job, save)
+        else:
+            if "maps_state" not in job:
+                job["maps_state"] = maps.new_stage(maps.maps_tasks(p["tasks"], p["depth"], p["language_code"]))
+                job["maps_rows"] = {}
+            await maps.run_maps_stage(job["maps_state"], job["maps_rows"], save)
         job["maps_done"] = True
         save(True)
 
@@ -266,10 +271,60 @@ async def run_maps_job(job):
         job["reviews_done"] = True
 
 
+async def run_adaptive_maps(job, save):
+    """County -> city -> ZIP. Each round searches the current frontier; any search that came back with
+    >= split_at places is split into its children for the next round. Fully resumable between rounds."""
+    p = job["params"]
+    if "plan" not in job:
+        job["plan"] = maps.build_plan(p["states"], p["category"], p.get("test_limit", 0))
+        job["maps_rows"], job["node_counts"], job["searched_kw"] = {}, {}, []
+        job["frontier"], job["round"] = list(job["plan"]["roots"]), 0
+        job["rounds"] = []
+    plan = job["plan"]
+    while job["frontier"]:
+        if "maps_state" not in job:
+            job["round"] += 1
+            job["maps_state"] = maps.new_stage(maps.plan_round_tasks(plan, job["frontier"], p["depth"], p["language_code"]))
+            save(True)
+        st = job["maps_state"]
+        async with maps.session() as s:
+            await maps.run_stage(s, f"{maps.DFS_BASE}/task_post", maps.DFS_BASE + "/task_get/advanced/{}", st,
+                                 maps.adaptive_on_ready(plan, job["maps_rows"], job["node_counts"], st["stats"]), save)
+        # decide what to split
+        searched = set(job["searched_kw"]) | {plan["nodes"][n]["kw"] for n in job["frontier"]}
+        nxt, full = [], 0
+        for nid in job["frontier"]:
+            if job["node_counts"].get(nid, 0) >= p["split_at"] and plan["nodes"][nid]["children"]:
+                full += 1
+                for c in plan["nodes"][nid]["children"]:
+                    if plan["nodes"][c]["kw"] not in searched:
+                        searched.add(plan["nodes"][c]["kw"])
+                        nxt.append(c)
+        job["rounds"].append({"round": job["round"], "searches": len(job["frontier"]), "split": full,
+                              "next": len(nxt), "cost": st["stats"]["cost"], "unique_places": len(job["maps_rows"])})
+        job["searched_kw"] = sorted(searched)
+        job["frontier"] = nxt
+        del job["maps_state"]
+        save(True)
+
+
+def _maps_stats(job):
+    if job.get("params", {}).get("strategy") == "adaptive" and "rounds" in job:
+        done = job["rounds"]
+        cur = (job.get("maps_state") or {}).get("stats", {})
+        return {"strategy": "adaptive", "round": job.get("round", 0),
+                "searches": sum(r["searches"] for r in done) + cur.get("tasks", 0),
+                "current_round": cur, "rounds": done,
+                "cost": round(sum(r["cost"] for r in done) + cur.get("cost", 0), 4),
+                "unique_places": len(job.get("maps_rows", {}))}
+    return job.get("maps_state", {}).get("stats")
+
+
 def _collect_stats(job):
     st = dict(job.get("stats") or {})
-    if "maps_state" in job:
-        st["maps"] = job["maps_state"]["stats"]
+    ms = _maps_stats(job)
+    if ms:
+        st["maps"] = ms
     if "reviews_state" in job:
         st["reviews"] = job["reviews_state"]["stats"]
     return st
@@ -328,8 +383,12 @@ async def create_maps_job(request):
     if not authed(request):
         return deny()
     body = await request.json()
+    strategy = str(body.get("strategy", "zip")).lower()
     tasks = [t for t in body.get("tasks", []) if isinstance(t, dict) and (t.get("keyword") or t.get("city"))]
-    if not tasks:
+    states = [STATE_NAMES.get(x, str(x).upper()) for x in (body.get("states") or [])]
+    if strategy == "adaptive" and not (states and body.get("category")):
+        return web.json_response({"error": "adaptive needs states and category"}, status=400)
+    if strategy != "adaptive" and not tasks:
         return web.json_response({"error": "no tasks"}, status=400)
     job_key = str(body.get("job_key", "")).strip().lower()[:200]
     # same job_key (e.g. "plumber|g2") within KEEP_DAYS -> hand back that job instead of paying again
@@ -338,10 +397,15 @@ async def create_maps_job(request):
             if j.get("job_key") == job_key and j["status"] != "error" and time.time() - j["created_at"] < KEEP_DAYS * 86400:
                 if j["status"] == "paused":
                     start(j)
-                return web.json_response({"job_id": j["id"], "tasks": len(j["params"]["tasks"]), "reused": True, "status": j["status"]})
+                return web.json_response({"job_id": j["id"], "reused": True, "status": j["status"]})
     rv = body.get("reviews") or {}
     params = {
+        "strategy": strategy,
         "tasks": tasks,
+        "states": states,
+        "category": str(body.get("category", "")).strip(),
+        "split_at": max(20, min(int(body.get("split_at", 100)), 700)),
+        "test_limit": max(0, int(body.get("test_limit", 0))),
         "depth": max(20, min(int(body.get("depth", 200)), 700)),
         "max_pages": max(1, min(int(body.get("max_pages", 10)), 20)),
         "language_code": body.get("language_code", "en"),
@@ -353,7 +417,7 @@ async def create_maps_job(request):
     job_id, job = new_job("maps", label=str(body.get("label", ""))[:200], job_key=job_key, params=params)
     save_job(job, force=True)
     start(job)
-    return web.json_response({"job_id": job_id, "tasks": len(tasks), "reused": False})
+    return web.json_response({"job_id": job_id, "strategy": strategy, "reused": False})
 
 
 async def create_email_job(request):
@@ -377,6 +441,10 @@ def _progress(job, stats):
     ph = job.get("phase")
     if ph == "maps" and "maps" in stats:
         m = stats["maps"]
+        if m.get("strategy") == "adaptive":
+            c = m.get("current_round") or {}
+            return (f"maps round {m.get('round', 0)}: {c.get('collected', 0)}/{c.get('tasks', 0)} searches, "
+                    f"{m.get('unique_places', 0)} places so far")
         return f"maps {m.get('collected', 0)}/{m.get('tasks', 0)} searches"
     if ph == "emails" and "emails" in stats:
         e = stats["emails"]

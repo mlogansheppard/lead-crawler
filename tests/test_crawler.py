@@ -278,3 +278,92 @@ def test_locations():
     assert any(c.startswith("Austin 787") for c in cities)
     assert all(re.match(r"^.+ \d{5}$", c) for c in cities)
     assert server.state_cities("new york")[1] == "NY"
+
+
+def test_adaptive_splits_only_full_areas_and_resumes(monkeypatch, tmp_path):
+    """Delaware: county searches that come back full get split into cities/ZIPs, sparse ones don't.
+    A balance problem in round 2 pauses the job; after a restart it finishes without re-posting anything."""
+    plan = server.maps.build_plan(["DE"], "plumber")
+    roots = plan["roots"]
+    full_root = next(r for r in roots if plan["nodes"][r]["children"])  # a county we'll make "full"
+    expected_round2 = len(plan["nodes"][full_root]["children"])
+
+    async def run():
+        site, base = await _start_site()
+        state = {"broke_after": len(roots) + 1}  # refuse posts once round 2 has started
+        posted = []
+        by_id = {}
+
+        async def task_post(r):
+            body = await r.json()
+            if len(posted) >= state["broke_after"]:
+                return web.json_response({"status_code": 40210, "status_message": "Insufficient funds.", "tasks": []}, status=402)
+            out = []
+            for b in body:
+                if len(posted) >= state["broke_after"]:
+                    out.append({"status_code": 40210, "status_message": "Insufficient funds."})
+                    continue
+                posted.append(b["keyword"])
+                tid = "t%d" % len(posted)
+                by_id[tid] = b
+                out.append({"id": tid, "status_code": 20100, "cost": 0.0006})
+            return web.json_response({"status_code": 20000, "tasks": out})
+
+        async def task_get(r):
+            b = by_id[r.match_info["tid"]]
+            n = 120 if b["tag"] == full_root else 2
+            items = [{"type": "maps_search", "title": f"{b['keyword']} #{i}", "cid": f"{b['tag']}-{i}", "url": base,
+                      "address": "1 Main St, Dover, DE 19901", "category": "Plumber"} for i in range(n)]
+            return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": items}]}]})
+
+        async def r_task_post(r):
+            body = await r.json()
+            return web.json_response({"tasks": [{"id": "r" + b["cid"], "status_code": 20100} for b in body]})
+
+        async def r_task_get(r):
+            return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": []}]}]})
+
+        dfs = web.Application()
+        dfs.router.add_post("/task_post", task_post)
+        dfs.router.add_get("/task_get/advanced/{tid}", task_get)
+        dfs.router.add_post("/r/task_post", r_task_post)
+        dfs.router.add_get("/r/task_get/{tid}", r_task_get)
+        dfs_srv = TestServer(dfs)
+        await dfs_srv.start_server()
+        monkeypatch.setattr(server.maps, "DFS_BASE", f"http://127.0.0.1:{dfs_srv.port}")
+        monkeypatch.setattr(server.maps, "DFS_REVIEWS_BASE", f"http://127.0.0.1:{dfs_srv.port}/r")
+        monkeypatch.setattr(server.maps, "DFS_LOGIN", "x")
+        monkeypatch.setattr(server.maps, "POLL_SECONDS", 0)
+        monkeypatch.setattr(server.maps.asyncio, "sleep", _fast_sleep)
+        monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(server, "RESUME_EVERY", 3600)
+        server.JOBS.clear()
+
+        client = TestClient(TestServer(server.make_app()))
+        await client.start_server()
+        body = {"strategy": "adaptive", "category": "plumber", "states": ["Delaware"], "split_at": 100}
+        jid = (await (await client.post("/maps-jobs", json=body)).json())["job_id"]
+        j1 = await _wait(client, jid)
+        await client.close()
+
+        state["broke_after"] = 10 ** 9  # topped up
+        server.JOBS.clear()
+        client = TestClient(TestServer(server.make_app()))
+        await client.start_server()
+        j2 = await _wait(client, jid)
+        text = await (await client.get(f"/jobs/{jid}/csv")).text()
+        await client.close()
+        await site.close()
+        await dfs_srv.close()
+        return j1, j2, posted, text
+
+    j1, j2, posted, text = asyncio.run(run())
+    assert j1["status"] == "paused" and j1["stats"]["maps"]["round"] == 2, j1
+    assert j2["status"] == "done", j2
+    m = j2["stats"]["maps"]
+    assert [r["searches"] for r in m["rounds"]][:2] == [len(roots), expected_round2], m["rounds"]
+    assert m["rounds"][0]["split"] == 1
+    assert len(posted) == len(set(posted)) == len(roots) + expected_round2  # nothing searched twice
+    assert posted[0].startswith("plumber in ") and "County, DE" in posted[0]
+    rows = list(csv.DictReader(io.StringIO(text)))
+    assert len(rows) == 120 + 2 * (len(roots) - 1) + 2 * expected_round2

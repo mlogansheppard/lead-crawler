@@ -2,7 +2,7 @@
 
 Small service for the cold-email list pipeline (n8n). One job does:
 
-1. Google Maps listings for every city task via DataForSEO (standard queue, depth 200, ads skipped, deduped by CID)
+1. Google Maps listings via DataForSEO (standard queue, depth 200, ads skipped, deduped by CID). Adaptive mode starts with one search per county and only splits a search into its cities, then ZIPs, when it comes back full (>= split_at places), so rural areas cost one search and metros still get every ZIP. City/county/ZIP data comes from the bundled `zipcodes` package.
 2. Visits each business website (homepage, contact/about/legal pages, guessed /contact paths, up to 10 pages) and pulls public emails
 3. For every business that has an email, pulls its lowest-rated Google reviews from DataForSEO (sort_by lowest_rating, depth 20) and keeps up to 5 one-star reviews, ones with text first
 4. Returns a listings CSV (columns match the n8n Transform step: NAME, CATEGORY, ADDRESS, STATE CODE, EMAIL, FACEBOOK, CID, URL=maps.google.com/?cid=...) and a reviews CSV (CID, SCORE, TEXT, PICTURES, USER NAME)
