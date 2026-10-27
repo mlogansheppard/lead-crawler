@@ -357,6 +357,13 @@ async def run_maps_job(job):
         save(True)
 
     rows = list(job["maps_rows"].values())
+    # Google pads thin areas with businesses from other states (national chains, telehealth, mobile services).
+    # Those belong to another group's run, so drop them here, before paying for their reviews.
+    wanted = {str(s).upper() for s in p.get("states") or []}
+    if wanted:
+        keep = [r for r in rows if not r.get("STATE CODE") or str(r["STATE CODE"]).upper() in wanted]
+        job["stats"]["dropped_outside_states"] = len(rows) - len(keep)
+        rows = keep
 
     # 2) website emails (free, but still remembered so a restart doesn't redo finished sites)
     if not job.get("emails_done"):

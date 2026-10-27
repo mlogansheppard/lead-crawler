@@ -324,6 +324,9 @@ def test_adaptive_splits_only_full_areas_and_resumes(monkeypatch, tmp_path):
             n = 120 if b["tag"] == full_root else 2
             items = [{"type": "maps_search", "title": f"{b['keyword']} #{i}", "cid": f"{b['tag']}-{i}", "url": base,
                       "address": "1 Main St, Dover, DE 19901", "category": "Plumber"} for i in range(n)]
+            if b["tag"] == full_root:  # Google padding a thin area with an out-of-state business
+                items.append({"type": "maps_search", "title": "Telehealth Co", "cid": "tx-1", "url": base,
+                              "address": "9 Elm St, Austin, TX 78701", "category": "Plumber"})
             return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": items}]}]})
 
         async def r_task_post(r):
@@ -377,6 +380,7 @@ def test_adaptive_splits_only_full_areas_and_resumes(monkeypatch, tmp_path):
     assert posted[0].startswith("plumber in ") and "County, DE" in posted[0]
     rows = list(csv.DictReader(io.StringIO(text)))
     assert len(rows) == 120 + 2 * (len(roots) - 2) + 2 * expected_round2
+    assert j2["stats"]["dropped_outside_states"] == 1 and not any(r["CID"] == "tx-1" for r in rows)
     assert m["rounds"][0]["searches"] == len(roots) and j2["stats"]["maps"]["rounds"][0]["unique_places"] > 0
 
 
