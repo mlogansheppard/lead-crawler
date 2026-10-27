@@ -74,12 +74,83 @@ async def scan(fn, *args):
 
 # ---------------------------------------------------------------- website crawling
 RETRYABLE = {"dns", "timeout", "connect", "other"}
+# Third pass for sites that refused us (bot protection / rate limits): fetched again looking exactly like Chrome
+# (TLS + HTTP/2 fingerprint and headers) via curl_cffi. BLOCKED_RETRY=1 turns it on.
+BLOCKED_RETRY = os.environ.get("BLOCKED_RETRY", "0") in ("1", "true", "yes")  # off until tested with blocked_probe.py
+BLOCKED_CONCURRENCY = int(os.environ.get("BLOCKED_CONCURRENCY", "20"))
+
+
+def is_blocked(err):
+    """A refusal worth retrying as a real browser: 401/403/406/429/503 and the like, not a missing page."""
+    err = err or ""
+    if err == "challenge":
+        return True
+    if err == "http_4xx":  # results saved before status codes were recorded
+        return True
+    if not err.startswith("http_"):
+        return False
+    try:
+        code = int(err.split("_")[1])
+    except ValueError:
+        return False
+    return code in (401, 403, 405, 406, 409, 418, 429, 451, 503, 520, 521, 522, 523, 524, 525, 526)
+
+
+_CHALLENGE = ("<title>just a moment...</title>", "cf-browser-verification", "/cdn-cgi/challenge-platform/h/",
+              "<title>attention required! | cloudflare</title>", "sucuri website firewall - access denied",
+              "please enable js and disable any ad blocker")
+
+
+def _is_challenge(page):
+    head = page[:20000].lower()
+    return len(page) < 60000 and any(m in head for m in _CHALLENGE)
+
+
+def _blocker(headers):
+    """Which bot protection answered, from the response headers ('' when unknown)."""
+    h = {k.lower(): str(v).lower() for k, v in headers.items()}
+    server = h.get("server", "")
+    if "cf-ray" in h or "cloudflare" in server or "cf-mitigated" in h:
+        return "cloudflare"
+    if "x-sucuri-id" in h or "sucuri" in server:
+        return "sucuri"
+    if "akamai" in server or "x-akamai-transformed" in h:
+        return "akamai"
+    if "x-iinfo" in h or "incap_ses" in h.get("set-cookie", ""):
+        return "imperva"
+    if "x-amzn-waf-action" in h or "awselb" in server:
+        return "aws"
+    if "wpe-backend" in h or "wp engine" in server:
+        return "wpengine"
+    if "x-wix-request-id" in h or "pepyaka" in server:
+        return "wix"
+    if "squarespace" in server:
+        return "squarespace"
+    if "x-litespeed-cache" in h or "litespeed" in server:
+        return "litespeed"
+    if "nginx" in server:
+        return "nginx"
+    if "apache" in server:
+        return "apache"
+    return ""
 
 
 def _err_kind(e):
     name = type(e).__name__
     if isinstance(e, asyncio.TimeoutError) or "Timeout" in name:
         return "timeout"
+    msg = str(e)
+    # curl_cffi (browser pass) errors carry curl's error number
+    if "curl: (28)" in msg:
+        return "timeout"
+    if "curl: (6)" in msg:
+        return "dns"
+    if "curl: (7)" in msg:
+        return "connect"
+    if "curl: (35)" in msg or "curl: (60)" in msg:
+        return "ssl"
+    if "curl: (47)" in msg:
+        return "redirects"
     if "DNS" in name or "gaierror" in str(e) or "Name or service not known" in str(e) or "Temporary failure in name resolution" in str(e):
         return "dns"
     if isinstance(e, aiohttp.ClientConnectorError) or "Connect" in name or isinstance(e, ConnectionError):
@@ -91,13 +162,52 @@ def _err_kind(e):
     return "other"
 
 
+class BrowserSession:
+    """Fetches the way real Chrome does (TLS and HTTP/2 fingerprint plus headers), for sites that refuse
+    ordinary clients. Only used for the blocked-sites pass, so most crawling stays on fast aiohttp."""
+
+    def __init__(self, concurrency, timeout):
+        from curl_cffi.requests import AsyncSession
+        self.s = AsyncSession(impersonate="chrome", max_clients=concurrency, timeout=timeout, verify=False,
+                              allow_redirects=True, max_redirects=6)
+
+    async def fetch_ex(self, url):
+        try:
+            async with self.s.stream("GET", url) as r:
+                if r.status_code >= 400:
+                    b = _blocker(r.headers)
+                    return None, str(r.url), f"http_{r.status_code}" + (f"@{b}" if b else "")
+                ctype = r.headers.get("content-type", "") or ""
+                if ctype and not any(t in ctype for t in ("html", "text", "xml")):
+                    return None, str(r.url), "not_html"
+                buf = bytearray()
+                async for chunk in r.aiter_content():
+                    buf += chunk
+                    if len(buf) >= MAX_BYTES:
+                        break
+                m = re.search(r"charset=([\w-]+)", ctype)
+                enc = m.group(1) if m else "utf-8"
+                try:
+                    return bytes(buf[:MAX_BYTES]).decode(enc, errors="replace"), str(r.url), ""
+                except LookupError:
+                    return bytes(buf[:MAX_BYTES]).decode("utf-8", errors="replace"), str(r.url), ""
+        except Exception as e:
+            return None, url, _err_kind(e)
+
+    async def close(self):
+        await self.s.close()
+
+
 async def fetch_ex(session, url):
-    """(body or None, final_url, error_kind or '')"""
+    """(body or None, final_url, error_kind or ''). A refusal comes back as e.g. 'http_403@cloudflare'."""
+    if isinstance(session, BrowserSession):
+        return await session.fetch_ex(url)
     try:
         async with session.get(url, allow_redirects=True, max_redirects=6, ssl=False) as r:
             ctype = r.headers.get("content-type", "")
             if r.status >= 400:
-                return None, str(r.url), f"http_{r.status // 100}xx"
+                b = _blocker(r.headers)
+                return None, str(r.url), f"http_{r.status}" + (f"@{b}" if b else "")
             if ctype and not any(t in ctype for t in ("html", "text", "xml")):
                 return None, str(r.url), "not_html"
             body = await r.content.read(MAX_BYTES)
@@ -113,7 +223,7 @@ async def fetch(session, url):
 
 async def crawl_site(session, site, max_pages, sem=None):
     sid, raw_url = site.get("id", ""), site.get("url", "")
-    res = {"id": sid, "url": raw_url, "emails": [], "types": [], "facebook": "", "pages": 0, "error": ""}
+    res = {"id": sid, "url": raw_url, "emails": [], "types": [], "facebook": "", "pages": 0, "error": "", "blocker": ""}
     home = normalize_site(raw_url)
     if not home:
         res["error"] = "skipped"
@@ -127,7 +237,11 @@ async def crawl_site(session, site, max_pages, sem=None):
             page, final, err2 = await fetch_ex(session, alt)
             err = err2 if err in ("", "other") else err
         if page is None:
-            res["error"] = err or "unreachable"
+            res["error"], _, res["blocker"] = (err or "unreachable").partition("@")
+            return res
+        if _is_challenge(page):
+            # a bot check ("Just a moment...") served with a 200: there is no real page to read
+            res["error"], res["blocker"] = "challenge", "cloudflare" if "cloudflare" in page.lower() else ""
             return res
         res["pages"] = 1
         # page scanning is CPU work: run it off the event loop so status checks from n8n stay instant
@@ -178,32 +292,44 @@ async def crawl_site(session, site, max_pages, sem=None):
     return res
 
 
-async def crawl_many(sites, max_pages, on_done=None, concurrency=None, page_timeout=None):
-    """concurrency/page_timeout given -> a gentler pass with its own limit (used to retry failed sites)."""
+async def crawl_many(sites, max_pages, on_done=None, concurrency=None, page_timeout=None, browser=False):
+    """concurrency/page_timeout given -> a gentler pass with its own limit (used to retry failed sites).
+    browser=True -> fetch as real Chrome (blocked-sites pass)."""
     sem = asyncio.Semaphore(concurrency) if concurrency else None
+    results = []
+    if browser:
+        session = BrowserSession(concurrency or BLOCKED_CONCURRENCY, page_timeout or RETRY_TIMEOUT)
+        try:
+            await _run_pool(session, sites, max_pages, on_done, sem, concurrency, results)
+        finally:
+            await session.close()
+        return results
     timeout = aiohttp.ClientTimeout(total=page_timeout or PAGE_TIMEOUT, connect=min(15, (page_timeout or PAGE_TIMEOUT)))
     conn = aiohttp.TCPConnector(limit=(concurrency or CONCURRENCY) * 2, ttl_dns_cache=3600, ssl=False)
     headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}
-    results = []
     async with aiohttp.ClientSession(timeout=timeout, connector=conn, headers=headers) as session:
-        async def one(s):
-            try:
-                r = await crawl_site(session, s, max_pages, sem)
-            except Exception as e:  # one bad site never kills the job
-                r = {"id": s.get("id", ""), "url": s.get("url", ""), "emails": [], "facebook": "", "pages": 0, "error": str(e)[:200]}
-            results.append(r)
-            if on_done:
-                on_done(r)
-        # a fixed pool of workers pulling from the list, instead of one task per site: an 18,000-site
-        # job no longer creates 18,000 tasks (and their memory) up front
-        queue = list(sites)
-        queue.reverse()
-
-        async def worker():
-            while queue:
-                await one(queue.pop())
-        await asyncio.gather(*(worker() for _ in range(min(len(queue), concurrency or CONCURRENCY) or 1)))
+        await _run_pool(session, sites, max_pages, on_done, sem, concurrency, results)
     return results
+
+
+async def _run_pool(session, sites, max_pages, on_done, sem, concurrency, results):
+    async def one(s):
+        try:
+            r = await crawl_site(session, s, max_pages, sem)
+        except Exception as e:  # one bad site never kills the job
+            r = {"id": s.get("id", ""), "url": s.get("url", ""), "emails": [], "facebook": "", "pages": 0, "error": str(e)[:200]}
+        results.append(r)
+        if on_done:
+            on_done(r)
+    # a fixed pool of workers pulling from the list, instead of one task per site: an 18,000-site
+    # job no longer creates 18,000 tasks (and their memory) up front
+    queue = list(sites)
+    queue.reverse()
+
+    async def worker():
+        while queue:
+            await one(queue.pop())
+    await asyncio.gather(*(worker() for _ in range(min(len(queue), concurrency or CONCURRENCY) or 1)))
 
 
 # ---------------------------------------------------------------- job persistence
@@ -302,6 +428,16 @@ async def run_email_job(job):
 AGENCY_MIN_SITES = int(os.environ.get("AGENCY_MIN_SITES", "3"))
 RETRY_CONCURRENCY = int(os.environ.get("RETRY_CONCURRENCY", "25"))
 RETRY_TIMEOUT = float(os.environ.get("RETRY_TIMEOUT", "25"))
+
+
+def _blocker_counts(done):
+    """Refusals by who refused us, e.g. {"cloudflare": 812, "": 301}."""
+    c = {}
+    for v in done.values():
+        if is_blocked(v.get("error")):
+            k = v.get("blocker") or "unknown"
+            c[k] = c.get(k, 0) + 1
+    return c
 
 
 def _error_counts(done):
@@ -429,7 +565,7 @@ async def run_maps_job(job):
 
         def tick(r):
             done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"],
-                             "error": r.get("error", ""), "pages": r.get("pages", 0)}
+                             "error": r.get("error", ""), "pages": r.get("pages", 0), "blocker": r.get("blocker", "")}
             est["crawled"] = len(done)
             est["with_email_so_far"] = sum(1 for v in done.values() if v["emails"])
             mins = max((time.time() - t0) / 60, 0.1)
@@ -449,7 +585,21 @@ async def run_maps_job(job):
             await crawl_many(retry, p["max_pages"], tick, concurrency=RETRY_CONCURRENCY, page_timeout=RETRY_TIMEOUT)
             est["recovered_by_retry"] = sum(1 for v in done.values() if v["emails"]) - before
             job["phase"] = "emails"
+        # third pass: sites that refused us (bot protection, rate limits) get one more try looking like Chrome
+        blocked = [{"id": k, "url": by_site[k]["url"], "contact_url": by_site[k]["contact_url"]}
+                   for k, v in done.items() if k in by_site and is_blocked(v.get("error"))]
+        if blocked and BLOCKED_RETRY:
+            job["phase"] = "emails (retrying blocked sites)"
+            est["blocked_retrying"] = len(blocked)
+            before = sum(1 for v in done.values() if v["emails"])
+            loaded_before = sum(1 for v in done.values() if not v.get("error"))
+            await crawl_many(blocked, p["max_pages"], tick, concurrency=BLOCKED_CONCURRENCY,
+                             page_timeout=RETRY_TIMEOUT, browser=True)
+            est["blocked_unlocked"] = sum(1 for v in done.values() if not v.get("error")) - loaded_before
+            est["recovered_from_blocked"] = sum(1 for v in done.values() if v["emails"]) - before
+            job["phase"] = "emails"
         est["errors"] = _error_counts(done)
+        est["blockers"] = _blocker_counts(done)
         job["email_filter"] = await clean_job_emails(done)
         job["emails_done"] = True
         save(True)

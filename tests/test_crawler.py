@@ -808,3 +808,39 @@ def test_crawl_many_runs_every_site_with_a_small_pool():
         return res
     res = asyncio.run(go())
     assert sorted(int(r["id"]) for r in res) == list(range(40))
+
+
+def test_blocked_site_is_retried_as_chrome():
+    """A site that refuses ordinary clients (no browser headers) but lets Chrome in."""
+    async def go():
+        def gate(r):
+            if "sec-ch-ua" not in {k.lower() for k in r.headers}:
+                return web.Response(status=403, text="denied", headers={"Server": "cloudflare", "CF-RAY": "x"})
+            return None
+
+        async def home(r):
+            return gate(r) or web.Response(text='<a href="/contact">c</a>', content_type="text/html")
+
+        async def contact(r):
+            return gate(r) or web.Response(text="write to owner@blocked-co.com", content_type="text/html")
+        app = web.Application()
+        app.router.add_get("/", home)
+        app.router.add_get("/contact", contact)
+        srv = TestServer(app)
+        await srv.start_server()
+        sites = [{"id": "s", "url": f"http://127.0.0.1:{srv.port}/"}]
+        normal = await server.crawl_many(sites, 5)
+        chrome = await server.crawl_many(sites, 5, concurrency=2, page_timeout=10, browser=True)
+        await srv.close()
+        return normal[0], chrome[0]
+    normal, chrome = asyncio.run(go())
+    assert normal["error"] == "http_403" and normal["blocker"] == "cloudflare" and server.is_blocked(normal["error"])
+    assert chrome["error"] == "" and chrome["emails"] == ["owner@blocked-co.com"] and chrome["pages"] >= 2
+
+
+def test_blocked_rules_and_challenge_pages():
+    assert server.is_blocked("http_403") and server.is_blocked("http_429") and server.is_blocked("http_4xx")
+    assert server.is_blocked("challenge") and not server.is_blocked("http_404") and not server.is_blocked("timeout")
+    assert server._blocker({"Server": "cloudflare"}) == "cloudflare" and server._blocker({"X-Sucuri-ID": "1"}) == "sucuri"
+    assert server._is_challenge("<html><head><title>Just a moment...</title></head><body>cloudflare</body></html>")
+    assert not server._is_challenge("<html><title>Acme Plumbing</title> email us</html>")
