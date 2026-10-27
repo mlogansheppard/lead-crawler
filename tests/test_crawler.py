@@ -287,6 +287,7 @@ def test_adaptive_splits_only_full_areas_and_resumes(monkeypatch, tmp_path):
     roots = plan["roots"]
     full_root = next(r for r in roots if plan["nodes"][r]["children"])  # a county we'll make "full"
     expected_round2 = len(plan["nodes"][full_root]["children"])
+    empty_root = next(r for r in roots if r != full_root)  # this county returns "40102 No Search Results"
 
     async def run():
         site, base = await _start_site()
@@ -311,6 +312,8 @@ def test_adaptive_splits_only_full_areas_and_resumes(monkeypatch, tmp_path):
 
         async def task_get(r):
             b = by_id[r.match_info["tid"]]
+            if b["tag"] == empty_root:
+                return web.json_response({"tasks": [{"status_code": 40102, "status_message": "No Search Results."}]})
             n = 120 if b["tag"] == full_root else 2
             items = [{"type": "maps_search", "title": f"{b['keyword']} #{i}", "cid": f"{b['tag']}-{i}", "url": base,
                       "address": "1 Main St, Dover, DE 19901", "category": "Plumber"} for i in range(n)]
@@ -366,4 +369,14 @@ def test_adaptive_splits_only_full_areas_and_resumes(monkeypatch, tmp_path):
     assert len(posted) == len(set(posted)) == len(roots) + expected_round2  # nothing searched twice
     assert posted[0].startswith("plumber in ") and "County, DE" in posted[0]
     rows = list(csv.DictReader(io.StringIO(text)))
-    assert len(rows) == 120 + 2 * (len(roots) - 1) + 2 * expected_round2
+    assert len(rows) == 120 + 2 * (len(roots) - 2) + 2 * expected_round2
+    assert m["rounds"][0]["searches"] == len(roots) and j2["stats"]["maps"]["rounds"][0]["unique_places"] > 0
+
+
+def test_account_problem_codes():
+    assert not server.maps.is_account_problem(40102, "No Search Results.")
+    assert server.maps.is_account_problem(40210, "Insufficient funds.")
+    assert server.maps.is_account_problem(40200, "Payment Required.")
+    assert server.maps.is_account_problem(40100, "You are not authorized to access this resource.")
+    assert not server.maps.is_account_problem(40501, "Invalid Field")
+    assert server.maps._pause_reason(200, {"status_code": 40102, "status_message": "No Search Results."}) is None

@@ -72,10 +72,30 @@ class DFSPaused(Exception):
     """DataForSEO refused us (bad key, no balance, or unreachable). Job state is kept so it can resume."""
 
 
+NO_RESULTS = 40102  # "No Search Results": a normal, empty search (e.g. a rural county), not an account problem
+
+
+def is_account_problem(code, msg=""):
+    """True only for key / auth / balance problems, which pause the job.
+    DataForSEO also uses 401xx for ordinary results like 40102 'No Search Results', so match narrowly."""
+    try:
+        code = int(code or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code == NO_RESULTS:
+        return False
+    if 40200 <= code < 40300:  # payment required / insufficient funds
+        return True
+    if code in (40100, 40101, 40104):  # not authorized / authentication failed / access denied
+        return True
+    m = (msg or "").lower()
+    return code // 100 == 401 and any(w in m for w in ("authoriz", "authent", "credential", "login", "password", "access denied"))
+
+
 def _pause_reason(http_status, data):
     code = (data or {}).get("status_code") if isinstance(data, dict) else None
     msg = (data or {}).get("status_message", "") if isinstance(data, dict) else ""
-    if http_status in (401, 402, 403) or (code and 40100 <= int(code) < 40300):
+    if http_status in (401, 402, 403) or is_account_problem(code, msg):
         return f"DataForSEO {code or http_status}: {msg or 'not authorized / payment required'}"
     return None
 
@@ -119,7 +139,7 @@ async def run_stage(s, post_url, get_url, state, on_ready, save):
                 state["pending"][t["id"]] = item[1]
                 stats["posted"] += 1
                 stats["cost"] = round(stats["cost"] + float(t.get("cost") or 0), 5)
-            elif code and 40100 <= int(code) < 40300:
+            elif is_account_problem(code, (t or {}).get("status_message", "")):
                 retry.append(item)
                 pause = f"DataForSEO {code}: {t.get('status_message', '')}"
             else:
@@ -168,7 +188,12 @@ async def run_stage(s, post_url, get_url, state, on_ready, save):
                 on_ready(key, t)
             elif code in (40601, 40602):
                 continue  # still queued
-            elif code and 40100 <= int(code) < 40300:
+            elif code == NO_RESULTS:
+                key = state["pending"].pop(tid)
+                stats["collected"] += 1
+                stats["no_results"] = stats.get("no_results", 0) + 1
+                on_ready(key, {"result": []})
+            elif is_account_problem(code, t.get("status_message", "")):
                 pause = f"DataForSEO {code}: {t.get('status_message', '')}"
             else:
                 state["pending"].pop(tid)
