@@ -19,6 +19,7 @@ All requests need header  X-API-Key: <API_KEY env>.
   Maps jobs also take "reviews": {"enabled": true, "depth": 20, "keep": 5, "max_rating": 1}
   (DataForSEO reviews sorted lowest_rating; keeps up to `keep` reviews rated <= max_rating, ones with text first).
   POST /jobs/{id}/resume        -> continue a paused job now (paused jobs also retry by themselves every 10 min)
+  POST /jobs/{id}/recrawl       -> finished job: re-crawl websites that gave no email (free); reviews only for new ones
   GET  /locations?state=Texas    -> {"cities": ["Austin 78701", ...]}  every active standard ZIP in the state
   GET  /health
 
@@ -70,19 +71,45 @@ async def scan(fn, *args):
 
 
 # ---------------------------------------------------------------- website crawling
-async def fetch(session, url):
+RETRYABLE = {"dns", "timeout", "connect", "other"}
+
+
+def _err_kind(e):
+    name = type(e).__name__
+    if isinstance(e, asyncio.TimeoutError) or "Timeout" in name:
+        return "timeout"
+    if "DNS" in name or "gaierror" in str(e) or "Name or service not known" in str(e) or "Temporary failure in name resolution" in str(e):
+        return "dns"
+    if isinstance(e, aiohttp.ClientConnectorError) or "Connect" in name or isinstance(e, ConnectionError):
+        return "connect"
+    if "SSL" in name or "Certificate" in name:
+        return "ssl"
+    if isinstance(e, aiohttp.TooManyRedirects):
+        return "redirects"
+    return "other"
+
+
+async def fetch_ex(session, url):
+    """(body or None, final_url, error_kind or '')"""
     try:
         async with session.get(url, allow_redirects=True, max_redirects=6, ssl=False) as r:
             ctype = r.headers.get("content-type", "")
-            if r.status >= 400 or (ctype and not any(t in ctype for t in ("html", "text", "xml"))):
-                return None, str(r.url)
+            if r.status >= 400:
+                return None, str(r.url), f"http_{r.status // 100}xx"
+            if ctype and not any(t in ctype for t in ("html", "text", "xml")):
+                return None, str(r.url), "not_html"
             body = await r.content.read(MAX_BYTES)
-            return body.decode(r.charset or "utf-8", errors="replace"), str(r.url)
-    except Exception:
-        return None, url
+            return body.decode(r.charset or "utf-8", errors="replace"), str(r.url), ""
+    except Exception as e:
+        return None, url, _err_kind(e)
 
 
-async def crawl_site(session, site, max_pages):
+async def fetch(session, url):
+    body, final, _ = await fetch_ex(session, url)
+    return body, final
+
+
+async def crawl_site(session, site, max_pages, sem=None):
     sid, raw_url = site.get("id", ""), site.get("url", "")
     res = {"id": sid, "url": raw_url, "emails": [], "types": [], "facebook": "", "pages": 0, "error": ""}
     home = normalize_site(raw_url)
@@ -90,13 +117,14 @@ async def crawl_site(session, site, max_pages):
         res["error"] = "skipped"
         return res
     started = time.monotonic()
-    async with SEM:
-        page, final = await fetch(session, home)
+    async with (sem or SEM):
+        page, final, err = await fetch_ex(session, home)
         if page is None:
             alt = "https://" + home[7:] if home.startswith("http://") else "http://" + home[8:]
-            page, final = await fetch(session, alt)
+            page, final, err2 = await fetch_ex(session, alt)
+            err = err2 if err in ("", "other") else err
         if page is None:
-            res["error"] = "unreachable"
+            res["error"] = err or "unreachable"
             return res
         res["pages"] = 1
         # page scanning is CPU work: run it off the event loop so status checks from n8n stay instant
@@ -147,15 +175,17 @@ async def crawl_site(session, site, max_pages):
     return res
 
 
-async def crawl_many(sites, max_pages, on_done=None):
-    timeout = aiohttp.ClientTimeout(total=PAGE_TIMEOUT, connect=8)
-    conn = aiohttp.TCPConnector(limit=CONCURRENCY * 2, ttl_dns_cache=600, ssl=False)
+async def crawl_many(sites, max_pages, on_done=None, concurrency=None, page_timeout=None):
+    """concurrency/page_timeout given -> a gentler pass with its own limit (used to retry failed sites)."""
+    sem = asyncio.Semaphore(concurrency) if concurrency else None
+    timeout = aiohttp.ClientTimeout(total=page_timeout or PAGE_TIMEOUT, connect=min(15, (page_timeout or PAGE_TIMEOUT)))
+    conn = aiohttp.TCPConnector(limit=(concurrency or CONCURRENCY) * 2, ttl_dns_cache=3600, ssl=False)
     headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}
     results = []
     async with aiohttp.ClientSession(timeout=timeout, connector=conn, headers=headers) as session:
         async def one(s):
             try:
-                r = await crawl_site(session, s, max_pages)
+                r = await crawl_site(session, s, max_pages, sem)
             except Exception as e:  # one bad site never kills the job
                 r = {"id": s.get("id", ""), "url": s.get("url", ""), "emails": [], "facebook": "", "pages": 0, "error": str(e)[:200]}
             results.append(r)
@@ -228,6 +258,16 @@ async def run_email_job(job):
 
 
 AGENCY_MIN_SITES = int(os.environ.get("AGENCY_MIN_SITES", "3"))
+RETRY_CONCURRENCY = int(os.environ.get("RETRY_CONCURRENCY", "25"))
+RETRY_TIMEOUT = float(os.environ.get("RETRY_TIMEOUT", "25"))
+
+
+def _error_counts(done):
+    c = {}
+    for v in done.values():
+        k = v.get("error") or ("ok_with_email" if v["emails"] else "ok_no_email")
+        c[k] = c.get(k, 0) + 1
+    return c
 
 
 async def clean_job_emails(done):
@@ -335,7 +375,8 @@ async def run_maps_job(job):
         t0, n0 = time.time(), len(done)
 
         def tick(r):
-            done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"]}
+            done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"],
+                             "error": r.get("error", ""), "pages": r.get("pages", 0)}
             est["crawled"] = len(done)
             est["with_email_so_far"] = sum(1 for v in done.values() if v["emails"])
             mins = max((time.time() - t0) / 60, 0.1)
@@ -343,6 +384,19 @@ async def run_maps_job(job):
             save()
         todo = [{"id": k, "url": v["url"], "contact_url": v["contact_url"]} for k, v in by_site.items() if k not in done]
         await crawl_many(todo, p["max_pages"], tick)
+        est["errors_first_pass"] = _error_counts(done)
+        # second, gentler pass for sites that failed on a network problem (DNS / timeout / connection):
+        # busy moments on the VPS or a slow host shouldn't cost us the email
+        retry = [{"id": k, "url": by_site[k]["url"], "contact_url": by_site[k]["contact_url"]}
+                 for k, v in done.items() if k in by_site and v.get("error") in RETRYABLE]
+        if retry:
+            job["phase"] = "emails (retrying failed sites)"
+            est["retrying"] = len(retry)
+            before = sum(1 for v in done.values() if v["emails"])
+            await crawl_many(retry, p["max_pages"], tick, concurrency=RETRY_CONCURRENCY, page_timeout=RETRY_TIMEOUT)
+            est["recovered_by_retry"] = sum(1 for v in done.values() if v["emails"]) - before
+            job["phase"] = "emails"
+        est["errors"] = _error_counts(done)
         job["email_filter"] = await clean_job_emails(done)
         job["emails_done"] = True
         save(True)
@@ -361,15 +415,23 @@ async def run_maps_job(job):
     rv = p["reviews"]
     if rv["enabled"] and not job.get("reviews_done"):
         job["phase"] = "reviews"
+        st = job.get("reviews_state")
+        if st and not st["todo"] and not st["pending"]:
+            # a finished review stage from before a re-crawl: start a new one for businesses not reviewed yet
+            job["reviews_cost_prev"] = round(job.get("reviews_cost_prev", 0) + st["stats"].get("cost", 0), 5)
+            job["reviews_kept_prev"] = job.get("reviews_kept_prev", 0) + st["stats"].get("kept", 0)
+            del job["reviews_state"]
         if "reviews_state" not in job:
             # skip businesses Google says have zero 1-star ratings (no point paying for their reviews)
             def wants(r):
                 ones = str(r.get("ONE STAR RATINGS", "")).strip()
                 return not (rv["max_rating"] <= 1 and ones == "0")
-            cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"] and wants(r)))
+            reviewed = set(job.get("reviewed_cids", []))
+            cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"] and wants(r) and r["CID"] not in reviewed))
             job["stats"]["reviews_skipped_no_1star"] = sum(1 for r in rows if r["EMAIL"] and r["CID"] and not wants(r))
             job["reviews_state"] = maps.new_stage(maps.reviews_tasks(cids, rv["depth"], p["language_code"]))
-            job["reviews"] = []
+            job["reviewed_cids"] = sorted(reviewed | set(cids))
+            job.setdefault("reviews", [])
         await maps.run_reviews_stage(job["reviews_state"], job["reviews"], rv["keep"], rv["max_rating"], save)
         job["reviews_done"] = True
 
@@ -429,7 +491,9 @@ def _collect_stats(job):
     if ms:
         st["maps"] = ms
     if "reviews_state" in job:
-        st["reviews"] = job["reviews_state"]["stats"]
+        st["reviews"] = dict(job["reviews_state"]["stats"])
+        st["reviews"]["cost_total"] = round(job.get("reviews_cost_prev", 0) + st["reviews"].get("cost", 0), 5)
+        st["reviews"]["kept_total"] = job.get("reviews_kept_prev", 0) + st["reviews"].get("kept", 0)
     return st
 
 
@@ -610,6 +674,31 @@ async def resume_job(request):
     return web.json_response({"resumed": False, "status": job["status"]})
 
 
+async def recrawl_job(request):
+    """Re-crawl every website in a finished job that gave no email (free), then look up reviews only for
+    businesses that newly got an email. Maps searches and earlier reviews are not paid for again."""
+    if not authed(request):
+        return deny()
+    job, err = get_job_or_404(request)
+    if err:
+        return err
+    if job["kind"] != "maps" or job["status"] not in ("done", "error"):
+        return web.json_response({"recrawl": False, "status": job["status"]}, status=409)
+    if "reviewed_cids" not in job:  # jobs from before this version: everything with an email was reviewed
+        job["reviewed_cids"] = sorted({r["CID"] for r in job.get("rows", []) if r.get("EMAIL") and r.get("CID")})
+    done = job.get("crawl_results", {})
+    redo = [k for k, v in done.items() if not v["emails"] and v.get("error") != "skipped"]
+    for k in redo:
+        done.pop(k, None)
+    job["emails_done"] = False
+    job["reviews_done"] = False
+    job["status"], job["phase"] = "queued", "queued"
+    job.pop("finished_at", None)
+    save_job(job, force=True)
+    start(job)
+    return web.json_response({"recrawl": True, "sites_to_recrawl": len(redo)})
+
+
 async def job_output(request):
     if not authed(request):
         return deny()
@@ -711,6 +800,7 @@ def make_app():
     app.router.add_post("/jobs", create_email_job)
     app.router.add_get("/jobs/{job_id}", job_status)
     app.router.add_post("/jobs/{job_id}/resume", resume_job)
+    app.router.add_post("/jobs/{job_id}/recrawl", recrawl_job)
     app.router.add_get("/jobs/{job_id}/csv", job_output)
     app.router.add_get("/jobs/{job_id}/{what:reviews}.csv", job_output)
     app.router.add_get("/locations", locations)

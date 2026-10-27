@@ -536,3 +536,91 @@ def test_queue_limits_parallel_jobs(monkeypatch, tmp_path):
 def test_no_cut_off_fragments_near_other_at_signs():
     html = '<li>' + 'x' * 60 + ' mary-ann@gmail.com, sales@bestroofing.net</li><img srcset="logo@2x.png 2x"><p>john.smith@gmail.com</p><style>@media(max-width:600px){.a{color:red}}</style>'
     assert sorted(extract.extract_emails(html)) == ["john.smith@gmail.com", "mary-ann@gmail.com", "sales@bestroofing.net"]
+
+
+def test_retry_pass_and_free_recrawl(monkeypatch, tmp_path):
+    async def run():
+        state = {"slow_first": True, "hits": {}, "has_email": {"b": False}}
+
+        async def page(r):
+            name = r.match_info["name"]
+            state["hits"][name] = state["hits"].get(name, 0) + 1
+            if name == "a" and state["hits"][name] <= 2:
+                await _real_sleep(1.0)   # slower than the first-pass timeout -> recovered by the retry pass
+            if name == "b" and not state["has_email"]["b"]:
+                return web.Response(text="<p>coming soon</p>", content_type="text/html")
+            return web.Response(text=f"<p>email {name}owner@gmail.com</p>", content_type="text/html")
+        site = web.Application()
+        site.router.add_get("/{name}/{rest:.*}", page)
+        site_srv = TestServer(site)
+        await site_srv.start_server()
+        base = f"http://127.0.0.1:{site_srv.port}"
+
+        reviews_posted = []
+
+        async def task_post(r):
+            body = await r.json()
+            return web.json_response({"tasks": [{"id": f"m{i}", "status_code": 20100} for i, _ in enumerate(body)]})
+
+        async def task_get(r):
+            items = [{"type": "maps_search", "title": n.upper(), "cid": n, "url": f"{base}/{n}/", "address": "1 Main St, Austin, TX 78701"}
+                     for n in ("a", "b")]
+            return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": items}]}]})
+
+        async def r_post(r):
+            body = await r.json()
+            reviews_posted.extend(b["cid"] for b in body)
+            return web.json_response({"tasks": [{"id": "r" + b["cid"], "status_code": 20100, "cost": 0.0015} for b in body]})
+
+        async def r_get(r):
+            return web.json_response({"tasks": [{"status_code": 20000, "result": [{"items": [{"rating": {"value": 1}, "review_text": "bad"}]}]}]})
+        dfs = web.Application()
+        dfs.router.add_post("/task_post", task_post)
+        dfs.router.add_get("/task_get/advanced/{tid}", task_get)
+        dfs.router.add_post("/r/task_post", r_post)
+        dfs.router.add_get("/r/task_get/{tid}", r_get)
+        dfs_srv = TestServer(dfs)
+        await dfs_srv.start_server()
+        monkeypatch.setattr(server.maps, "DFS_BASE", f"http://127.0.0.1:{dfs_srv.port}")
+        monkeypatch.setattr(server.maps, "DFS_REVIEWS_BASE", f"http://127.0.0.1:{dfs_srv.port}/r")
+        monkeypatch.setattr(server.maps, "DFS_LOGIN", "x")
+        monkeypatch.setattr(server.maps, "POLL_SECONDS", 0)
+        monkeypatch.setattr(server.maps.asyncio, "sleep", _fast_sleep)
+        monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(server, "PAGE_TIMEOUT", 0.3)
+        monkeypatch.setattr(server, "RETRY_TIMEOUT", 3.0)
+        server.JOBS.clear()
+        client = TestClient(TestServer(server.make_app()))
+        await client.start_server()
+        jid = (await (await client.post("/maps-jobs", json={"tasks": [{"city": "Austin 78701", "category": "x", "state_code": "TX"}],
+                                                            "max_pages": 1})).json())["job_id"]
+        for _ in range(300):
+            j = await (await client.get(f"/jobs/{jid}")).json()
+            if j["status"] in ("done", "error"):
+                break
+            await _real_sleep(0.05)
+        first = j
+        state["has_email"]["b"] = True   # site b now shows an email
+        rc = await (await client.post(f"/jobs/{jid}/recrawl")).json()
+        for _ in range(300):
+            j = await (await client.get(f"/jobs/{jid}")).json()
+            if j["status"] in ("done", "error"):
+                break
+            await _real_sleep(0.05)
+        text = await (await client.get(f"/jobs/{jid}/csv")).text()
+        rtext = await (await client.get(f"/jobs/{jid}/reviews.csv")).text()
+        await client.close()
+        await site_srv.close()
+        await dfs_srv.close()
+        return first, rc, j, text, rtext, reviews_posted
+
+    first, rc, j, text, rtext, reviews_posted = asyncio.run(run())
+    e1 = first["stats"]["emails"]
+    assert first["status"] == "done", first
+    assert e1["errors_first_pass"].get("timeout") == 1 and e1["recovered_by_retry"] == 1, e1   # a: timed out, then recovered
+    assert rc == {"recrawl": True, "sites_to_recrawl": 1}   # only b (no email) is re-crawled
+    rows = {r["CID"]: r for r in csv.DictReader(io.StringIO(text))}
+    assert rows["a"]["EMAIL"] == "aowner@gmail.com" and rows["b"]["EMAIL"] == "bowner@gmail.com"
+    assert reviews_posted == ["a", "b"]   # a reviewed once in the first run, b only after the re-crawl
+    assert len(list(csv.DictReader(io.StringIO(rtext)))) == 2
+    assert j["stats"]["reviews"]["cost_total"] == 0.003
