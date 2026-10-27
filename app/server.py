@@ -58,6 +58,15 @@ FB_RE = re.compile(r"https?://(?:www\.|m\.)?facebook\.com/(?!sharer|share|plugin
 
 JOBS = {}
 SEM = asyncio.Semaphore(CONCURRENCY)
+# Two separate thread pools: page scanning (CPU) must never queue behind / block DNS lookups, which
+# aiohttp also runs in threads. The default pool is only ~cpu+4 threads, far too few for 80+ open sites.
+from concurrent.futures import ThreadPoolExecutor
+SCAN_POOL = ThreadPoolExecutor(max_workers=max(2, min(8, (os.cpu_count() or 2))), thread_name_prefix="scan")
+DNS_POOL = ThreadPoolExecutor(max_workers=max(64, CONCURRENCY), thread_name_prefix="dns")
+
+
+async def scan(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(SCAN_POOL, fn, *args)
 
 
 # ---------------------------------------------------------------- website crawling
@@ -91,12 +100,12 @@ async def crawl_site(session, site, max_pages):
             return res
         res["pages"] = 1
         # page scanning is CPU work: run it off the event loop so status checks from n8n stay instant
-        emails = await asyncio.to_thread(extract_emails, page)
+        emails = await scan(extract_emails, page)
         fb = FB_RE.search(page)
         res["facebook"] = fb.group(0).split("?")[0] if fb else ""
 
         root = "{0.scheme}://{0.netloc}".format(urlparse(final))
-        queue = await asyncio.to_thread(contact_links, page, final)
+        queue = await scan(contact_links, page, final)
         # Google's own "contact" link for the listing goes first, if it's on the same site
         cu = site.get("contact_url") or ""
         if cu and registrable(urlparse(cu).hostname or "") == registrable(urlparse(final).hostname or ""):
@@ -129,7 +138,7 @@ async def crawl_site(session, site, max_pages):
             if sub is None:
                 continue
             res["pages"] += 1
-            for e in await asyncio.to_thread(extract_emails, sub):
+            for e in await scan(extract_emails, sub):
                 if e not in emails:
                     emails.append(e)
         typed = rank_emails_typed(emails, final)[:MAX_EMAILS]
@@ -323,9 +332,14 @@ async def run_maps_job(job):
         est.update({"listings": len(rows), "with_website": sum(v["n"] for v in by_site.values()),
                     "unique_sites": len(by_site), "crawled": len(done)})
 
+        t0, n0 = time.time(), len(done)
+
         def tick(r):
             done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"]}
             est["crawled"] = len(done)
+            est["with_email_so_far"] = sum(1 for v in done.values() if v["emails"])
+            mins = max((time.time() - t0) / 60, 0.1)
+            est["sites_per_min"] = round((len(done) - n0) / mins, 1)
             save()
         todo = [{"id": k, "url": v["url"], "contact_url": v["contact_url"]} for k, v in by_site.items() if k not in done]
         await crawl_many(todo, p["max_pages"], tick)
@@ -537,7 +551,8 @@ def _progress(job, stats):
         return f"maps {m.get('collected', 0)}/{m.get('tasks', 0)} searches"
     if ph == "emails" and "emails" in stats:
         e = stats["emails"]
-        return f"emails {e.get('crawled', 0)}/{e.get('unique_sites', 0)} sites"
+        return (f"emails {e.get('crawled', 0)}/{e.get('unique_sites', 0)} sites, {e.get('with_email_so_far', 0)} with email"
+                + (f", {e['sites_per_min']}/min" if e.get("sites_per_min") else ""))
     if ph == "reviews" and "reviews" in stats:
         r = stats["reviews"]
         return f"reviews {r.get('collected', 0)}/{r.get('tasks', 0)} businesses"
@@ -638,6 +653,7 @@ async def health(_):
 async def background(app):
     """On startup: reload saved jobs and continue any that were running or paused.
     Then every RESUME_EVERY seconds retry paused jobs (e.g. after a DataForSEO top-up) and clean up old ones."""
+    asyncio.get_running_loop().set_default_executor(DNS_POOL)
     load_jobs()
     for j in list(JOBS.values()):
         if j["kind"] == "maps" and j["status"] in ("running", "paused"):
