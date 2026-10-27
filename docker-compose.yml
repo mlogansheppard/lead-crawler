@@ -17,6 +17,8 @@ services:
       - RESUME_EVERY_SECONDS=600
       # extra jobs wait in a queue; raise on a bigger VPS
       - MAX_ACTIVE_JOBS=2
+      # third pass that re-fetches sites that refused us as real Chrome; set BLOCKED_RETRY=1 in .env to turn on
+      - BLOCKED_RETRY=${BLOCKED_RETRY:-0}
     volumes:
       # saved job progress, so a paused or restarted job picks up where it left off
       - ./data:/data
