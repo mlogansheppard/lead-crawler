@@ -116,7 +116,10 @@ def test_maps_job(monkeypatch, tmp_path):
                 return web.json_response({"tasks": [{"status_code": 40602}]})
             items = [
                 {"type": "maps_paid_item", "title": "Ad"},
+                {"type": "maps_search", "title": "Perfect Co", "cid": "333", "url": base, "rating_distribution": {"1": 0, "5": 40},
+                 "address": "2 Main St, Austin, TX 78701", "category": "Plumber"},
                 {"type": "maps_search", "title": "Acme Plumbing LLC", "cid": "111", "url": base, "phone": "+1 512",
+                 "rating_distribution": {"1": 3, "5": 10}, "contact_url": base + "contact-us",
                  "address": "1 Main St, Austin, TX 78701", "address_info": {"address": "1 Main St", "city": "Austin", "zip": "78701"},
                  "category": "Plumber", "additional_categories": ["Plumber", "Drainage service"], "rating": {"value": 4.1, "votes_count": 20}},
             ]
@@ -168,14 +171,15 @@ def test_maps_job(monkeypatch, tmp_path):
     assert posted[0]["keyword"] == "plumber in Austin, TX 78701" and posted[0]["depth"] == 200
     assert j["status"] == "done", j
     rows = list(csv.DictReader(io.StringIO(text)))
-    assert len(rows) == 2  # deduped by CID, ad skipped
+    assert len(rows) == 3  # deduped by CID, ad skipped
     acme = [r for r in rows if r["CID"] == "111"][0]
     assert acme["EMAIL"] == "owner@gmail.com" and acme["STATE CODE"] == "TX"
     assert acme["URL"] == "https://maps.google.com/?cid=111"
     assert acme["CATEGORY"] == "Plumber, Drainage service"
     assert j["stats"]["maps"]["ads_skipped"] == 2
     # reviews: only the business with an email, sorted lowest, 5 kept, 1-star only, text first
-    assert len(rposted) == 1 and rposted[0]["cid"] == "111" and rposted[0]["sort_by"] == "lowest_rating"
+    assert len(rposted) == 1 and rposted[0]["cid"] == "111" and rposted[0]["sort_by"] == "lowest_rating"  # 333 has no 1-star ratings
+    assert acme["ONE STAR RATINGS"] == "3" and j["stats"]["reviews_skipped_no_1star"] == 1
     revs = list(csv.DictReader(io.StringIO(rtext)))
     assert len(revs) == 5 and all(r["SCORE"] == "1" and r["TEXT"] for r in revs), revs
     assert revs[0]["TEXT"] == "bad 0" and revs[0]["PICTURES"] == "https://img/0.jpg"

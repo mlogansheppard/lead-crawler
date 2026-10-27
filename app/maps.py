@@ -32,6 +32,16 @@ def build_keyword(task):
     return f"{task.get('category', '').strip()} in {loc}".strip()
 
 
+def _one_star(item):
+    dist = item.get("rating_distribution")
+    if isinstance(dist, dict) and dist:
+        try:
+            return int(dist.get("1") or 0)
+        except (TypeError, ValueError):
+            return ""
+    return ""  # unknown
+
+
 def slim(item, search_city):
     """One DataForSEO maps_search item -> one flat row (column names match the old lobstr CSV where it matters)."""
     ai = item.get("address_info") or {}
@@ -59,6 +69,8 @@ def slim(item, search_city):
         "RATING": rating.get("value") if rating.get("value") is not None else "",
         "REVIEWS COUNT": rating.get("votes_count") if rating.get("votes_count") is not None else "",
         "IS CLAIMED": item.get("is_claimed") if item.get("is_claimed") is not None else "",
+        "ONE STAR RATINGS": _one_star(item),
+        "CONTACT URL": item.get("contact_url") or "",
         "CID": cid,
         "PLACE ID": item.get("place_id") or "",
         "URL": f"https://maps.google.com/?cid={cid}" if cid else "",

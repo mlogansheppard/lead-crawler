@@ -96,6 +96,10 @@ async def crawl_site(session, site, max_pages):
 
         root = "{0.scheme}://{0.netloc}".format(urlparse(final))
         queue = contact_links(page, final)
+        # Google's own "contact" link for the listing goes first, if it's on the same site
+        cu = site.get("contact_url") or ""
+        if cu and registrable(urlparse(cu).hostname or "") == registrable(urlparse(final).hostname or ""):
+            queue = [cu] + [u for u in queue if u.rstrip("/") != cu.rstrip("/")]
         if len(queue) < 2 and max_pages > 1:
             # menus built by JavaScript hide their links; the sitemap still lists the contact/about pages
             sm, _ = await fetch(session, urljoin(root, "/sitemap.xml"))
@@ -287,7 +291,9 @@ async def run_maps_job(job):
         for r in rows:
             k = _site_key(r["WEBSITE"])
             if k:
-                by_site.setdefault(k, {"url": r["WEBSITE"], "n": 0})["n"] += 1
+                e = by_site.setdefault(k, {"url": r["WEBSITE"], "n": 0, "contact_url": ""})
+                e["n"] += 1
+                e["contact_url"] = e["contact_url"] or r.get("CONTACT URL", "")
         done = job.setdefault("crawl_results", {})
         est = job["stats"].setdefault("emails", {})
         est.update({"listings": len(rows), "with_website": sum(v["n"] for v in by_site.values()),
@@ -297,7 +303,7 @@ async def run_maps_job(job):
             done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"]}
             est["crawled"] = len(done)
             save()
-        todo = [{"id": k, "url": v["url"]} for k, v in by_site.items() if k not in done]
+        todo = [{"id": k, "url": v["url"], "contact_url": v["contact_url"]} for k, v in by_site.items() if k not in done]
         await crawl_many(todo, p["max_pages"], tick)
         job["email_filter"] = await clean_job_emails(done)
         job["emails_done"] = True
@@ -318,7 +324,12 @@ async def run_maps_job(job):
     if rv["enabled"] and not job.get("reviews_done"):
         job["phase"] = "reviews"
         if "reviews_state" not in job:
-            cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"]))
+            # skip businesses Google says have zero 1-star ratings (no point paying for their reviews)
+            def wants(r):
+                ones = str(r.get("ONE STAR RATINGS", "")).strip()
+                return not (rv["max_rating"] <= 1 and ones == "0")
+            cids = list(dict.fromkeys(r["CID"] for r in rows if r["EMAIL"] and r["CID"] and wants(r)))
+            job["stats"]["reviews_skipped_no_1star"] = sum(1 for r in rows if r["EMAIL"] and r["CID"] and not wants(r))
             job["reviews_state"] = maps.new_stage(maps.reviews_tasks(cids, rv["depth"], p["language_code"]))
             job["reviews"] = []
         await maps.run_reviews_stage(job["reviews_state"], job["reviews"], rv["keep"], rv["max_rating"], save)
