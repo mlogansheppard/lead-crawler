@@ -363,7 +363,7 @@ def build_plan(state_codes, category, test_limit=0):
     return {"nodes": nodes, "roots": roots}
 
 
-DEEP_DEPTH = 700  # DataForSEO's max; only used to re-search an area that came back full and can't be split
+DEEP_DEPTH = 200  # re-search depth for an area that came back full and can't be split (a ZIP or a city with no ZIP list)
 
 
 def plan_round_tasks(plan, frontier, depth, language_code, deep=()):

@@ -703,7 +703,7 @@ def test_full_zip_gets_one_deep_research(monkeypatch):
     async def fake_stage(s, post, get, state, on_ready, save):
         for body, nid in state["todo"]:
             calls.append((nid, body["depth"]))
-            n = 100 if body["depth"] == 100 else 340
+            n = 100 if body["depth"] == 100 else 180
             on_ready(nid, {"result": [{"items": [{"type": "maps_search", "title": f"{nid}{body['depth']}-{i}",
                                                   "cid": f"{nid}{body['depth']}-{i}", "address": "1 Main St, Dover, DE 19901"}
                                                  for i in range(n)]}]})
@@ -711,8 +711,8 @@ def test_full_zip_gets_one_deep_research(monkeypatch):
     monkeypatch.setattr(server.maps, "run_stage", fake_stage)
     job = {"params": {"states": ["DE"], "category": "medspa", "split_at": 100, "depth": 100, "language_code": "en"}}
     asyncio.run(server.run_adaptive_maps(job, lambda force=False: None))
-    assert calls == [("c", 100), ("z", 100), ("z", 700)], calls
-    assert len(job["maps_rows"]) == 100 + 100 + 340
+    assert calls == [("c", 100), ("z", 100), ("z", 200)], calls
+    assert len(job["maps_rows"]) == 100 + 100 + 180
 
 
 def test_one_review_lookup_per_business():
