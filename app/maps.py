@@ -171,7 +171,9 @@ async def run_stage(s, post_url, get_url, state, on_ready, save):
             else:
                 stats["post_errors"] += 1  # bad task (e.g. invalid field) - skip it
         state["todo"] = retry + state["todo"][len(chunk):]
-        save()
+        # saved right away (not throttled): if the crawler restarted before this was on disk, these tasks
+        # would be posted and paid for a second time, and the first charge would be missing from the cost
+        save(force=True)
         if pause:
             save(force=True)
             raise DFSPaused(pause)
