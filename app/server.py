@@ -642,16 +642,26 @@ async def run_maps_job(job):
         est.update({"listings": len(rows), "with_website": sum(v["n"] for v in by_site.values()),
                     "unique_sites": len(by_site), "crawled": len(done)})
 
+        # speed over the whole crawl, across restarts: crawl seconds are kept in the job, so a restart near the
+        # end doesn't turn "the last few hundred sites" into the run's speed
         t0, n0 = time.time(), len(done)
+        secs_before = est.get("crawl_secs", 0)
+        with_email = [sum(1 for v in done.values() if v["emails"])]
 
         def tick(r):
+            old = done.get(r["id"])
+            if old and old.get("emails"):
+                with_email[0] -= 1
             done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"],
                              "error": r.get("error", ""), "pages": r.get("pages", 0), "blocker": r.get("blocker", ""),
                              "at": round(time.time())}
+            if r["emails"]:
+                with_email[0] += 1
             est["crawled"] = len(done)
-            est["with_email_so_far"] = sum(1 for v in done.values() if v["emails"])
-            mins = max((time.time() - t0) / 60, 0.1)
-            est["sites_per_min"] = round((len(done) - n0) / mins, 1)
+            est["with_email_so_far"] = with_email[0]
+            est["crawl_secs"] = round(secs_before + (time.time() - t0))
+            est["sites_per_min"] = round(len(done) / max(est["crawl_secs"] / 60, 0.1), 1)
+            est["sites_per_min_now"] = round((len(done) - n0) / max((time.time() - t0) / 60, 0.1), 1)
             save()
         todo = [{"id": k, "url": v["url"], "contact_url": v["contact_url"]} for k, v in by_site.items() if k not in done]
         await crawl_many(todo, p["max_pages"], tick)

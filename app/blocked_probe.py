@@ -1,6 +1,9 @@
 """Test the blocked-sites pass on real sites before trusting it in production.
 
-  docker exec lead-crawler python3 blocked_probe.py [sample_size] [job_id]
+  docker exec lead-crawler python3 blocked_probe.py [sample_size] [job_id] [error]
+
+error: blocked (default; also re-tests SSL failures) or any saved error such as connect, timeout, dns -
+those are re-tried with the normal crawler first, then as Chrome.
 
 Also re-tests sites whose Chrome pass ended in an SSL error, to see whether they load when tried later.
 
@@ -19,8 +22,13 @@ import time
 import server
 
 
+WHICH = sys.argv[3] if len(sys.argv) > 3 else "blocked"
+
+
 def _want(err):
-    return server.is_blocked(err) or err == "ssl"
+    if WHICH == "blocked":
+        return server.is_blocked(err) or err == "ssl"
+    return (err or "") == WHICH
 
 
 def pick_job(job_id=None):
@@ -50,6 +58,12 @@ async def main():
           f"{len(blocked)} blocked of {len(done)} sites; testing {len(sample)}")
     print("before:", dict(collections.Counter(done[k].get("error") for k in sample).most_common(8)))
     sites = [{"id": k, **urls[k]} for k in sample]
+    if WHICH != "blocked":
+        t = time.time()
+        plain = await server.crawl_many(sites, job["params"].get("max_pages", 10), concurrency=20)
+        ok = [r for r in plain if not r.get("error")]
+        print(f"normal crawler now: {len(ok)}/{len(plain)} loaded, {sum(1 for r in plain if r['emails'])} with an email "
+              f"({time.time() - t:.0f}s); still failing: {dict(collections.Counter(r['error'] for r in plain if r.get('error')).most_common(6))}")
     t = time.time()
     res = await server.crawl_many(sites, job["params"].get("max_pages", 10), concurrency=server.BLOCKED_CONCURRENCY,
                                   page_timeout=server.RETRY_TIMEOUT, browser=True)
