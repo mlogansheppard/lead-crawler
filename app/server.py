@@ -315,15 +315,9 @@ class SharedResolver(aiohttp.abc.AbstractResolver):
         key = (host, port, family)
         hit = self._cache.get(key)
         if hit is not None:
-            if isinstance(hit, Exception):
-                raise hit
-            return hit
-        try:
-            res = await self._inner.resolve(host, port, family)
-        except Exception as e:
-            self._cache[key] = e
-            raise
-        self._cache[key] = res
+            return [dict(x) for x in hit]  # a fresh copy each time: aiohttp may change the list it's given
+        res = await self._inner.resolve(host, port, family)  # failures aren't cached: the next try asks again
+        self._cache[key] = [dict(x) for x in res]
         return res
 
     async def block_of(self, url):
