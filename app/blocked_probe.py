@@ -2,6 +2,8 @@
 
   docker exec lead-crawler python3 blocked_probe.py [sample_size] [job_id]
 
+Also re-tests sites whose Chrome pass ended in an SSL error, to see whether they load when tried later.
+
 Takes sites that refused the normal crawler in the newest finished job (or the job given), fetches a
 random sample again as real Chrome, and prints how many now load and how many give an email.
 Nothing is saved; the job is not changed."""
@@ -17,13 +19,17 @@ import time
 import server
 
 
+def _want(err):
+    return server.is_blocked(err) or err == "ssl"
+
+
 def pick_job(job_id=None):
     if job_id:
         return json.load(open(server.job_path(job_id)))
     paths = sorted(glob.glob(os.path.join(server.DATA_DIR, "job-*.json")), key=os.path.getmtime, reverse=True)
     for p in paths:
         j = json.load(open(p))
-        if any(server.is_blocked(v.get("error")) for v in (j.get("crawl_results") or {}).values()):
+        if any(_want(v.get("error")) for v in (j.get("crawl_results") or {}).values()):
             return j
     sys.exit("no job with blocked sites found")
 
@@ -37,7 +43,7 @@ async def main():
         k = server._site_key(r.get("WEBSITE") or "")
         if k and k not in urls:
             urls[k] = {"url": r["WEBSITE"], "contact_url": r.get("CONTACT URL", "")}
-    blocked = [k for k, v in done.items() if server.is_blocked(v.get("error")) and k in urls]
+    blocked = [k for k, v in done.items() if _want(v.get("error")) and k in urls]
     random.seed(7)
     sample = random.sample(blocked, min(n, len(blocked)))
     print(f"job {job['id']} ({job['params'].get('label') or job['params'].get('category')}): "
