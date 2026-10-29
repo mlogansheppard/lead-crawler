@@ -35,12 +35,14 @@ import json
 import os
 import re
 import shutil
+import socket
 import time
 import traceback
 import uuid
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+import aiohttp.abc
 from aiohttp import web
 
 from extract import (FREE_PROVIDERS, GUESSED_PATHS, contact_links, extract_emails, normalize_site,
@@ -78,6 +80,8 @@ RETRYABLE = {"dns", "timeout", "connect", "other"}
 # (TLS + HTTP/2 fingerprint and headers) via curl_cffi. BLOCKED_RETRY=1 turns it on.
 BLOCKED_RETRY = os.environ.get("BLOCKED_RETRY", "0") in ("1", "true", "yes")  # off until tested with blocked_probe.py
 BLOCKED_CONCURRENCY = int(os.environ.get("BLOCKED_CONCURRENCY", "20"))
+# how long a blocked site rests before the Chrome retry (many sites ban an IP for a while after a bot check)
+BLOCKED_MIN_AGE = int(os.environ.get("BLOCKED_MIN_AGE_SECONDS", "1800"))
 
 
 def is_blocked(err):
@@ -292,27 +296,75 @@ async def crawl_site(session, site, max_pages, sem=None):
     return res
 
 
+# Hosting platforms (Squarespace, Wix, GoDaddy...) serve thousands of these small sites from a few IP
+# ranges. Crawling dozens of them at once looks like an attack to the platform and it starts answering
+# 429 "too many requests" to our IP (Squarespace blocks went from ~30 to ~270 per run in one day).
+# So at most PER_HOST_BLOCK sites on the same /24 network are crawled at the same time.
+PER_HOST_BLOCK = int(os.environ.get("PER_HOST_BLOCK", "15"))
+
+
+class SharedResolver(aiohttp.abc.AbstractResolver):
+    """DNS answers cached for the whole run and shared by the per-platform limit and aiohttp,
+    so each website's name is looked up once."""
+
+    def __init__(self):
+        self._inner = aiohttp.ThreadedResolver()
+        self._cache = {}
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        key = (host, port, family)
+        hit = self._cache.get(key)
+        if hit is not None:
+            if isinstance(hit, Exception):
+                raise hit
+            return hit
+        try:
+            res = await self._inner.resolve(host, port, family)
+        except Exception as e:
+            self._cache[key] = e
+            raise
+        self._cache[key] = res
+        return res
+
+    async def block_of(self, url):
+        """'198.185.159' for a site hosted there, None when the name doesn't resolve."""
+        host = urlparse(url if "://" in url else "http://" + url).hostname
+        if not host:
+            return None
+        try:
+            res = await self.resolve(host, 0, socket.AF_INET)
+        except Exception:
+            return None
+        ip = res[0]["host"] if res else ""
+        return ".".join(ip.split(".")[:3]) if ip.count(".") == 3 else None
+
+    async def close(self):
+        await self._inner.close()
+
+
 async def crawl_many(sites, max_pages, on_done=None, concurrency=None, page_timeout=None, browser=False):
     """concurrency/page_timeout given -> a gentler pass with its own limit (used to retry failed sites).
     browser=True -> fetch as real Chrome (blocked-sites pass)."""
     sem = asyncio.Semaphore(concurrency) if concurrency else None
     results = []
+    resolver = SharedResolver()
     if browser:
         session = BrowserSession(concurrency or BLOCKED_CONCURRENCY, page_timeout or RETRY_TIMEOUT)
         try:
-            await _run_pool(session, sites, max_pages, on_done, sem, concurrency, results)
+            await _run_pool(session, sites, max_pages, on_done, sem, concurrency, results, resolver)
         finally:
             await session.close()
+            await resolver.close()
         return results
     timeout = aiohttp.ClientTimeout(total=page_timeout or PAGE_TIMEOUT, connect=min(15, (page_timeout or PAGE_TIMEOUT)))
-    conn = aiohttp.TCPConnector(limit=(concurrency or CONCURRENCY) * 2, ttl_dns_cache=3600, ssl=False)
+    conn = aiohttp.TCPConnector(limit=(concurrency or CONCURRENCY) * 2, ttl_dns_cache=3600, ssl=False, resolver=resolver)
     headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}
     async with aiohttp.ClientSession(timeout=timeout, connector=conn, headers=headers) as session:
-        await _run_pool(session, sites, max_pages, on_done, sem, concurrency, results)
+        await _run_pool(session, sites, max_pages, on_done, sem, concurrency, results, resolver)
     return results
 
 
-async def _run_pool(session, sites, max_pages, on_done, sem, concurrency, results):
+async def _run_pool(session, sites, max_pages, on_done, sem, concurrency, results, resolver=None):
     async def one(s):
         try:
             r = await crawl_site(session, s, max_pages, sem)
@@ -326,10 +378,35 @@ async def _run_pool(session, sites, max_pages, on_done, sem, concurrency, result
     # job no longer creates 18,000 tasks (and their memory) up front
     queue = list(sites)
     queue.reverse()
+    deferred = []
+    busy = {}
 
     async def worker():
-        while queue:
-            await one(queue.pop())
+        while queue or deferred:
+            s = block = None
+            # a site set aside earlier goes first as soon as its platform has room again
+            for i, (ds, db) in enumerate(deferred[:50]):
+                if busy.get(db, 0) < PER_HOST_BLOCK:
+                    s, block = deferred.pop(i)
+                    break
+            if s is None:
+                if queue:
+                    s = queue.pop()
+                    block = await resolver.block_of(s.get("url") or "") if resolver else None
+                    if block and busy.get(block, 0) >= PER_HOST_BLOCK:
+                        deferred.append((s, block))  # this platform is at its limit: do other sites meanwhile
+                        continue
+                else:
+                    s, block = deferred.pop(0)
+                    while busy.get(block, 0) >= PER_HOST_BLOCK:
+                        await asyncio.sleep(0.2)
+            if block:
+                busy[block] = busy.get(block, 0) + 1
+            try:
+                await one(s)
+            finally:
+                if block:
+                    busy[block] -= 1
     await asyncio.gather(*(worker() for _ in range(min(len(queue), concurrency or CONCURRENCY) or 1)))
 
 
@@ -569,7 +646,8 @@ async def run_maps_job(job):
 
         def tick(r):
             done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"],
-                             "error": r.get("error", ""), "pages": r.get("pages", 0), "blocker": r.get("blocker", "")}
+                             "error": r.get("error", ""), "pages": r.get("pages", 0), "blocker": r.get("blocker", ""),
+                             "at": round(time.time())}
             est["crawled"] = len(done)
             est["with_email_so_far"] = sum(1 for v in done.values() if v["emails"])
             mins = max((time.time() - t0) / 60, 0.1)
@@ -595,25 +673,34 @@ async def run_maps_job(job):
             await crawl_many(retry, p["max_pages"], tick, concurrency=RETRY_CONCURRENCY, page_timeout=RETRY_TIMEOUT)
             est["recovered_by_retry"] = sum(1 for v in done.values() if v["emails"]) - before
             job["phase"] = "emails"
-        # third pass: sites that refused us (bot protection, rate limits) get one more try looking like Chrome
-        blocked = [{"id": k, "url": by_site[k]["url"], "contact_url": by_site[k]["contact_url"]}
-                   for k, v in done.items() if k in by_site and is_blocked(v.get("error"))]
-        if blocked and BLOCKED_RETRY:
-            job["phase"] = "emails (retrying blocked sites)"
-            est["blocked_retrying"] = len(blocked)
-            before = sum(1 for v in done.values() if v["emails"])
-            loaded_before = sum(1 for v in done.values() if not v.get("error"))
-            await crawl_many(blocked, p["max_pages"], tick, concurrency=BLOCKED_CONCURRENCY,
-                             page_timeout=RETRY_TIMEOUT, browser=True)
-            est["blocked_unlocked"] = sum(1 for v in done.values() if not v.get("error")) - loaded_before
-            est["recovered_from_blocked"] = sum(1 for v in done.values() if v["emails"]) - before
-            job["phase"] = "emails"
         est["errors"] = _error_counts(done)
         est["blockers"] = _blocker_counts(done)
         job["email_filter"] = await clean_job_emails(done)
         job["emails_done"] = True
         save(True)
 
+    _assign_emails(job, rows)
+    job["rows"] = rows
+    job["maps_rows"] = {}
+    for k in ("plan", "node_counts", "searched_kw", "deep_done", "frontier", "deep_round"):
+        job.pop(k, None)  # only needed while the Maps searches run
+
+    # 3) DataForSEO reviews, lowest rating first, only for businesses we can email
+    await _reviews_phase(job, rows, save)
+
+    # 4) sites that refused us get one more try as real Chrome. It runs after the reviews on purpose: many sites
+    # ban an IP for a while after it trips their bot check, so retrying right away mostly fails (5-19% got
+    # through) while the same sites tried later mostly load (46-65%). Then reviews for what it unlocked.
+    if BLOCKED_RETRY and not job.get("blocked_done"):
+        if await _blocked_pass(job, rows, save):
+            job["reviews_done"] = False
+            await _reviews_phase(job, rows, save)
+        job["blocked_done"] = True
+        save(True)
+    job["stats"]["warnings"] = _health_warnings(job)
+
+
+def _assign_emails(job, rows):
     done = job.get("crawl_results", {})
     for r in rows:
         res = done.get(_site_key(r["WEBSITE"])) or done.get(_legacy_site_key(r["WEBSITE"]))
@@ -622,12 +709,75 @@ async def run_maps_job(job):
         r["FACEBOOK"] = res["facebook"] if res else ""
     job["stats"].setdefault("emails", {})["filtered"] = job.get("email_filter", {})
     job["stats"].setdefault("emails", {})["listings_with_email"] = sum(1 for r in rows if r["EMAIL"])
-    job["rows"] = rows
-    job["maps_rows"] = {}
-    for k in ("plan", "node_counts", "searched_kw", "deep_done", "frontier", "deep_round"):
-        job.pop(k, None)  # only needed while the Maps searches run
 
-    # 3) DataForSEO reviews, lowest rating first, only for businesses we can email
+
+async def _blocked_pass(job, rows, save):
+    """Returns True when it found new emails (so reviews need looking up for them)."""
+    p = job["params"]
+    done = job.get("crawl_results", {})
+    est = job["stats"].setdefault("emails", {})
+    by_site = {}
+    for r in rows:
+        k = _site_key(r["WEBSITE"])
+        if k and k not in by_site:
+            by_site[k] = {"url": r["WEBSITE"], "contact_url": r.get("CONTACT URL", "")}
+    blocked = [k for k, v in done.items() if k in by_site and is_blocked(v.get("error"))]
+    if not blocked:
+        return False
+    # wait until every blocked site was last tried at least BLOCKED_MIN_AGE ago (usually the reviews took
+    # most of that already)
+    newest = max(done[k].get("at", 0) for k in blocked)
+    while time.time() - newest < BLOCKED_MIN_AGE:
+        left = int(BLOCKED_MIN_AGE - (time.time() - newest))
+        job["phase"] = f"waiting {max(1, left // 60)} min before retrying blocked sites"
+        await asyncio.sleep(min(60, max(1, left)))
+    job["phase"] = "emails (retrying blocked sites)"
+    est["blocked_retrying"] = len(blocked)
+    before = sum(1 for v in done.values() if v["emails"])
+    loaded_before = sum(1 for v in done.values() if not v.get("error"))
+
+    def tick(r):
+        done[r["id"]] = {"emails": r["emails"], "types": r.get("types", []), "facebook": r["facebook"],
+                         "error": r.get("error", ""), "pages": r.get("pages", 0), "blocker": r.get("blocker", ""),
+                         "at": round(time.time())}
+        save()
+    sites = [{"id": k, **by_site[k]} for k in blocked]
+    await crawl_many(sites, p["max_pages"], tick, concurrency=BLOCKED_CONCURRENCY, page_timeout=RETRY_TIMEOUT, browser=True)
+    est["blocked_unlocked"] = sum(1 for v in done.values() if not v.get("error")) - loaded_before
+    job["email_filter"] = await clean_job_emails(done)
+    est["recovered_from_blocked"] = sum(1 for v in done.values() if v["emails"]) - before
+    est["errors"] = _error_counts(done)
+    _assign_emails(job, rows)
+    save(True)
+    return est["recovered_from_blocked"] > 0
+
+
+def _health_warnings(job):
+    """Plain-language problems worth a look, shown in the sheet (empty when the run looks normal)."""
+    est = job["stats"].get("emails", {})
+    first = est.get("errors_first_pass") or {}
+    sites = max(est.get("unique_sites") or 0, 1)
+    out = []
+    blocked = sum(n for k, n in first.items() if is_blocked(k))
+    rate_limited = first.get("http_429", 0)
+    net = sum(first.get(k, 0) for k in RETRYABLE)
+    with_email = (est.get("with_email_so_far") or 0) / sites
+    if blocked / sites > 0.20:
+        out.append(f"{blocked / sites:.0%} of sites blocked us (normal is 11-16%)")
+    if rate_limited / sites > 0.03:
+        out.append(f"{rate_limited / sites:.1%} of sites rate-limited us (429s, normal is under 2%)")
+    if net / sites > RETRY_MIN_SHARE:
+        out.append(f"{net / sites:.0%} of sites failed on the network (normal is ~11%)")
+    speed = est.get("sites_per_min") or 0
+    if sites > 2000 and 0 < speed < 150:
+        out.append(f"crawl ran at {speed:.0f} sites/min (normal is 250-550)")
+    if sites > 500 and with_email < 0.35:
+        out.append(f"only {with_email:.0%} of sites had an email (normal is 46-57%)")
+    return out
+
+
+async def _reviews_phase(job, rows, save):
+    p = job["params"]
     rv = p["reviews"]
     if rv["enabled"] and not job.get("reviews_done"):
         job["phase"] = "reviews"
@@ -644,7 +794,7 @@ async def run_maps_job(job):
             reviewed = set(job.get("reviewed_cids", []))
             cids, same_biz = pick_review_cids(rows, reviewed, wants)
             job["stats"]["reviews_skipped_no_1star"] = sum(1 for r in rows if r["EMAIL"] and r["CID"] and not wants(r))
-            job["stats"]["reviews_skipped_same_business"] = same_biz
+            job["stats"]["reviews_skipped_same_business"] = job["stats"].get("reviews_skipped_same_business", 0) + same_biz
             job["reviews_state"] = maps.new_stage(maps.reviews_tasks(cids, rv["depth"], p["language_code"]))
             job["reviewed_cids"] = sorted(reviewed | set(cids))
             job.setdefault("reviews", [])

@@ -140,7 +140,11 @@ def clean_email(e: str) -> str:
     if e.count("@") != 1 or len(e) > 100:
         return ""
     local, dom = e.split("@")
-    if not local or not dom or ".." in e:
+    if "%" in local:
+        # URL-encoded junk glued on the front, e.g. Outlook link data "05%7c02%7cjane@acme.com"
+        local = re.split(r"%[0-9a-f]{2}", local)[-1]
+        e = local + "@" + dom
+    if not local or not dom or ".." in e or "%" in e:
         return ""
     if dom.endswith(BAD_EXT) or e.endswith(BAD_EXT) or re.search(r"@\d+x\.", e):
         return ""

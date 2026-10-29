@@ -868,3 +868,81 @@ def test_chain_and_isp_mailboxes_are_not_agencies(monkeypatch):
     assert all(done[f"bigplumb.com/locations/{x}"]["emails"] == ["info@bigplumb.com"] for x in "abc")
     assert done["joesroof.com"]["emails"] == ["joe@rr.com"] and done["joesroof.com"]["types"] == ["free"]
     assert all(done[f"x{i}.com"]["emails"] == [] for i in (1, 2, 3))
+
+
+def test_same_platform_sites_are_capped(monkeypatch):
+    """Many sites on one hosting platform (same /24) are never crawled more than PER_HOST_BLOCK at a time."""
+    monkeypatch.setattr(server, "PER_HOST_BLOCK", 3)
+    state = {"now": 0, "peak": 0}
+
+    async def go():
+        async def home(r):
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+            await asyncio.sleep(0.05)
+            state["now"] -= 1
+            return web.Response(text="hi@x.com", content_type="text/html")
+        app = web.Application()
+        app.router.add_get("/", home)
+        srv = TestServer(app)
+        await srv.start_server()
+        sites = [{"id": str(i), "url": f"http://127.0.0.1:{srv.port}/?n={i}"} for i in range(30)]
+        res = await server.crawl_many(sites, 1, concurrency=20)
+        await srv.close()
+        return res
+    res = asyncio.run(go())
+    assert len(res) == 30 and all(r["emails"] == ["hi@x.com"] for r in res)
+    assert state["peak"] <= 3, state
+
+
+def test_blocked_pass_waits_and_finds_reviews_for_new_emails(monkeypatch, tmp_path):
+    """The Chrome pass rests blocked sites, then reviews get looked up for businesses it unlocked."""
+    monkeypatch.setattr(server, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "BLOCKED_RETRY", True)
+    monkeypatch.setattr(server, "BLOCKED_MIN_AGE", 2)
+    looked_up = []
+
+    async def fake_crawl(sites, max_pages, tick, **kw):
+        assert kw.get("browser")
+        for st in sites:
+            tick({"id": st["id"], "emails": ["owner@blocked.com"], "types": ["personal"], "facebook": "", "error": "", "pages": 2})
+
+    async def fake_reviews(state, out, keep, max_rating, save):
+        looked_up.extend(state["todo"])
+        state["todo"] = []
+
+    async def no_dead(domains):
+        return set()
+    monkeypatch.setattr(server, "crawl_many", fake_crawl)
+    monkeypatch.setattr(server.maps, "run_reviews_stage", fake_reviews)
+    monkeypatch.setattr(server.mxcheck, "dead_domains", no_dead)
+    rows = [{"CID": "9", "WEBSITE": "https://blocked.com/", "NAME": "B", "RATING": "4.0", "REVIEWS COUNT": "50",
+             "STATE CODE": "TX", "EMAIL": "", "EMAIL TYPES": "", "FACEBOOK": ""}]
+    import time as _t
+    job = {"id": "bp", "kind": "maps", "status": "running", "created_at": 0, "stats": {"emails": {}},
+           "params": {"max_pages": 5, "language_code": "en", "reviews": {"enabled": True, "depth": 10, "keep": 5, "max_rating": 3}},
+           "crawl_results": {"blocked.com": {"emails": [], "error": "http_403", "blocker": "cloudflare", "at": round(_t.time())}},
+           "reviews_done": True, "reviews_state": {"todo": [], "pending": {}, "stats": {"cost": 0}}, "reviews": []}
+    t0 = _t.time()
+    found = asyncio.run(server._blocked_pass(job, rows, lambda force=False: None))
+    assert found and _t.time() - t0 >= 1.5  # it rested the site first
+    assert rows[0]["EMAIL"] == "owner@blocked.com" and job["stats"]["emails"]["recovered_from_blocked"] == 1
+    job["reviews_done"] = False
+    asyncio.run(server._reviews_phase(job, rows, lambda force=False: None))
+    assert len(looked_up) == 1
+
+
+def test_url_encoded_junk_is_cut_from_emails():
+    assert extract.clean_email("05%7c02%7cmalik.stokes@acme.com") == "malik.stokes@acme.com"
+    assert extract.clean_email("%20info@acme.com") == "info@acme.com"
+    assert extract.clean_email("a%zz@acme.com") == ""
+
+
+def test_health_warnings():
+    job = {"stats": {"emails": {"unique_sites": 10000, "with_email_so_far": 5000, "sites_per_min": 400,
+                                "errors_first_pass": {"http_403": 1200, "http_429": 100, "dns": 500}}}}
+    assert server._health_warnings(job) == []
+    job["stats"]["emails"]["errors_first_pass"] = {"http_403": 2500, "http_429": 400}
+    job["stats"]["emails"]["sites_per_min"] = 90
+    w = server._health_warnings(job)
+    assert any("blocked" in x for x in w) and any("rate-limited" in x for x in w) and any("sites/min" in x for x in w)
