@@ -825,6 +825,7 @@ def start(job):
             await guard(job, runner)
             if job["kind"] == "maps":
                 lighten(job)
+                _trim_memory()
         finally:
             RUNNING.discard(job["id"])
             start_next()
@@ -1024,7 +1025,32 @@ async def job_output(request):
 # scrapes. Now n8n only moves the small pieces: the emails to verify, MillionVerifier's results, the business
 # names to clean, and the finished files.
 
+# n8n calls summary -> mv.csv -> mv-results -> build for each job; the merged list is built once and reused
+# (reading a 30,000-row job back from disk four times is what pushed the crawler's memory to ~3 GB)
+_EXPORT_CACHE = {}
+
+
+def _trim_memory():
+    """Hand freed memory back to the OS (Python keeps it otherwise, so the crawler's footprint only grows)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _export_base(job):
+    key = (job["id"], job.get("finished_at"))
+    hit = _EXPORT_CACHE.get(job["id"])
+    if hit and hit[0] == key:
+        return hit[1]
+    out = _build_export_base(job)
+    _EXPORT_CACHE.clear()  # one job's list at a time is plenty
+    _EXPORT_CACHE[job["id"]] = (key, out)
+    return out
+
+
+def _build_export_base(job):
     job = full_job(job)
     p = job["params"]
     codes = [str(c).upper() for c in p.get("states") or []]
@@ -1131,6 +1157,8 @@ async def export_build(request):
             with open(os.path.join(d, fn), "w", encoding="utf-8", newline="") as fh:
                 fh.write(text)
             out.append({"fileName": name, "rows": n, "path": f"/jobs/{job['id']}/export/files/{fn}"})
+        _EXPORT_CACHE.pop(job["id"], None)
+        _trim_memory()
         return out, counts, st
     files, counts, st = await asyncio.get_running_loop().run_in_executor(SCAN_POOL, work)
     return web.json_response({"files": files, "mv_counts": counts, **st})
