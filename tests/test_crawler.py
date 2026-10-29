@@ -946,3 +946,53 @@ def test_health_warnings():
     job["stats"]["emails"]["sites_per_min"] = 90
     w = server._health_warnings(job)
     assert any("blocked" in x for x in w) and any("rate-limited" in x for x in w) and any("sites/min" in x for x in w)
+
+
+def test_blocked_pass_goes_through_proxy_and_meters_bandwidth(monkeypatch):
+    """With PROXY_URL set, sites that refuse our IP (connect errors) are fetched through the proxy."""
+    async def go():
+        async def anything(r):  # a stand-in proxy: answers every forwarded request itself
+            return web.Response(text='<a href="/contact">c</a> reach owner@refused-co.com', content_type="text/html")
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", anything)
+        srv = TestServer(app)
+        await srv.start_server()
+        proxy = f"http://127.0.0.1:{srv.port}"
+        meter = {}
+        sites = [{"id": "refused-co.com", "url": "http://refused-co.com/"}]  # not a real site: only the proxy can answer
+        res = await server.crawl_many(sites, 3, concurrency=2, page_timeout=10, browser=True, proxy=proxy, meter=meter)
+        await srv.close()
+        return res, meter
+    res, meter = asyncio.run(go())
+    assert res[0]["emails"] == ["owner@refused-co.com"], res
+    assert meter["bytes"] > 0
+
+
+def test_with_proxy_refused_sites_are_retried_without_waiting(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "BLOCKED_MIN_AGE", 3600)
+    monkeypatch.setattr(server, "PROXY_URL", "http://proxy.example:8000")
+    seen = {}
+
+    async def fake_crawl(sites, max_pages, tick, **kw):
+        seen["ids"], seen["proxy"], seen["max_pages"] = sorted(s["id"] for s in sites), kw.get("proxy"), max_pages
+        kw["meter"]["bytes"] = 2_000_000
+        for st in sites:
+            tick({"id": st["id"], "emails": [], "types": [], "facebook": "", "error": "http_404", "pages": 1})
+
+    async def no_dead(domains):
+        return set()
+    monkeypatch.setattr(server, "crawl_many", fake_crawl)
+    monkeypatch.setattr(server.mxcheck, "dead_domains", no_dead)
+    import time as _t
+    now = round(_t.time())
+    rows = [{"CID": str(i), "WEBSITE": f"https://{d}/", "EMAIL": "", "EMAIL TYPES": "", "FACEBOOK": ""}
+            for i, d in enumerate(["refused.com", "cf.com", "dead.com"])]
+    job = {"id": "px", "stats": {"emails": {}}, "params": {"max_pages": 10},
+           "crawl_results": {"refused.com": {"emails": [], "facebook": "", "error": "connect", "at": now},
+                             "cf.com": {"emails": [], "facebook": "", "error": "http_403", "at": now},
+                             "dead.com": {"emails": [], "facebook": "", "error": "dns", "at": now}}}
+    t0 = _t.time()
+    asyncio.run(server._blocked_pass(job, rows, lambda force=False: None))
+    assert _t.time() - t0 < 5  # no hour-long rest through a proxy
+    assert seen == {"ids": ["cf.com", "refused.com"], "proxy": "http://proxy.example:8000", "max_pages": 5}
+    assert job["stats"]["proxy"]["mb"] == 2.2 and job["stats"]["proxy"]["cost"] == 0.0022

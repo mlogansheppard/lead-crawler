@@ -82,6 +82,12 @@ BLOCKED_RETRY = os.environ.get("BLOCKED_RETRY", "0") in ("1", "true", "yes")  # 
 BLOCKED_CONCURRENCY = int(os.environ.get("BLOCKED_CONCURRENCY", "20"))
 # how long a blocked site rests before the Chrome retry (many sites ban an IP for a while after a bot check)
 BLOCKED_MIN_AGE = int(os.environ.get("BLOCKED_MIN_AGE_SECONDS", "1800"))
+# Optional proxy for that retry (e.g. a rotating residential proxy: http://user:pass@host:port in .env).
+# With it, sites that refuse the VPS's IP outright (connection refused / reset) are retried too, from
+# other IPs, and the retry doesn't need to wait. Bandwidth is metered and added to the run's cost.
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+PROXY_COST_PER_GB = float(os.environ.get("PROXY_COST_PER_GB", "1.0"))
+PROXY_MAX_PAGES = int(os.environ.get("PROXY_MAX_PAGES", "5"))  # fewer pages per site = less paid bandwidth
 
 
 def is_blocked(err):
@@ -170,14 +176,17 @@ class BrowserSession:
     """Fetches the way real Chrome does (TLS and HTTP/2 fingerprint plus headers), for sites that refuse
     ordinary clients. Only used for the blocked-sites pass, so most crawling stays on fast aiohttp."""
 
-    def __init__(self, concurrency, timeout):
+    def __init__(self, concurrency, timeout, proxy=""):
         from curl_cffi.requests import AsyncSession
+        kw = {"proxy": proxy} if proxy else {}
         self.s = AsyncSession(impersonate="chrome", max_clients=concurrency, timeout=timeout, verify=False,
-                              allow_redirects=True, max_redirects=6)
+                              allow_redirects=True, max_redirects=6, **kw)
+        self.bytes = 0  # body bytes received (for proxy cost)
 
     async def fetch_ex(self, url):
         try:
             async with self.s.stream("GET", url) as r:
+                self.bytes += 600  # request + response headers, roughly
                 if r.status_code >= 400:
                     b = _blocker(r.headers)
                     return None, str(r.url), f"http_{r.status_code}" + (f"@{b}" if b else "")
@@ -187,6 +196,7 @@ class BrowserSession:
                 buf = bytearray()
                 async for chunk in r.aiter_content():
                     buf += chunk
+                    self.bytes += len(chunk)
                     if len(buf) >= MAX_BYTES:
                         break
                 m = re.search(r"charset=([\w-]+)", ctype)
@@ -336,17 +346,21 @@ class SharedResolver(aiohttp.abc.AbstractResolver):
         await self._inner.close()
 
 
-async def crawl_many(sites, max_pages, on_done=None, concurrency=None, page_timeout=None, browser=False):
+async def crawl_many(sites, max_pages, on_done=None, concurrency=None, page_timeout=None, browser=False, proxy="",
+                     meter=None):
     """concurrency/page_timeout given -> a gentler pass with its own limit (used to retry failed sites).
     browser=True -> fetch as real Chrome (blocked-sites pass)."""
     sem = asyncio.Semaphore(concurrency) if concurrency else None
     results = []
     resolver = SharedResolver()
     if browser:
-        session = BrowserSession(concurrency or BLOCKED_CONCURRENCY, page_timeout or RETRY_TIMEOUT)
+        session = BrowserSession(concurrency or BLOCKED_CONCURRENCY, page_timeout or RETRY_TIMEOUT, proxy)
         try:
-            await _run_pool(session, sites, max_pages, on_done, sem, concurrency, results, resolver)
+            # through a proxy every site comes from a different IP: no need to limit per hosting network
+            await _run_pool(session, sites, max_pages, on_done, sem, concurrency, results, None if proxy else resolver)
         finally:
+            if meter is not None:
+                meter["bytes"] = meter.get("bytes", 0) + session.bytes
             await session.close()
             await resolver.close()
         return results
@@ -725,13 +739,15 @@ async def _blocked_pass(job, rows, save):
         k = _site_key(r["WEBSITE"])
         if k and k not in by_site:
             by_site[k] = {"url": r["WEBSITE"], "contact_url": r.get("CONTACT URL", "")}
-    blocked = [k for k, v in done.items() if k in by_site and is_blocked(v.get("error"))]
+    def wanted(err):
+        return is_blocked(err) or (PROXY_URL and (err or "") in ("connect", "ssl"))
+    blocked = [k for k, v in done.items() if k in by_site and wanted(v.get("error"))]
     if not blocked:
         return False
     # wait until every blocked site was last tried at least BLOCKED_MIN_AGE ago (usually the reviews took
-    # most of that already)
+    # most of that already). Not needed through a proxy: those requests come from other IPs.
     newest = max(done[k].get("at", 0) for k in blocked)
-    while time.time() - newest < BLOCKED_MIN_AGE:
+    while not PROXY_URL and time.time() - newest < BLOCKED_MIN_AGE:
         left = int(BLOCKED_MIN_AGE - (time.time() - newest))
         job["phase"] = f"waiting {max(1, left // 60)} min before retrying blocked sites"
         await asyncio.sleep(min(60, max(1, left)))
@@ -746,7 +762,14 @@ async def _blocked_pass(job, rows, save):
                          "at": round(time.time())}
         save()
     sites = [{"id": k, **by_site[k]} for k in blocked]
-    await crawl_many(sites, p["max_pages"], tick, concurrency=BLOCKED_CONCURRENCY, page_timeout=RETRY_TIMEOUT, browser=True)
+    meter = {}
+    await crawl_many(sites, min(p["max_pages"], PROXY_MAX_PAGES) if PROXY_URL else p["max_pages"], tick,
+                     concurrency=BLOCKED_CONCURRENCY, page_timeout=RETRY_TIMEOUT, browser=True, proxy=PROXY_URL, meter=meter)
+    if PROXY_URL:
+        mb = meter.get("bytes", 0) * 1.1 / 1e6  # +10% for TLS and protocol overhead
+        px = job["stats"].setdefault("proxy", {"mb": 0, "cost": 0})
+        px["mb"] = round(px["mb"] + mb, 1)
+        px["cost"] = round(px["mb"] / 1000 * PROXY_COST_PER_GB, 4)
     est["blocked_unlocked"] = sum(1 for v in done.values() if not v.get("error")) - loaded_before
     job["email_filter"] = await clean_job_emails(done)
     est["recovered_from_blocked"] = sum(1 for v in done.values() if v["emails"]) - before
