@@ -812,6 +812,7 @@ async def _reviews_phase(job, rows, save):
         if st and not st["todo"] and not st["pending"]:
             # a finished review stage from before a re-crawl: start a new one for businesses not reviewed yet
             job["reviews_cost_prev"] = round(job.get("reviews_cost_prev", 0) + st["stats"].get("cost", 0), 5)
+            job["reviews_tasks_prev"] = job.get("reviews_tasks_prev", 0) + st["stats"].get("tasks", 0)
             job["reviews_kept_prev"] = job.get("reviews_kept_prev", 0) + st["stats"].get("kept", 0)
             del job["reviews_state"]
         if "reviews_state" not in job:
@@ -937,7 +938,8 @@ def _maps_stats(job):
                 "searches": sum(r["searches"] for r in done) + cur.get("tasks", 0),
                 "current_round": cur, "rounds": done,
                 "cost": round(sum(r["cost"] for r in done) + cur.get("cost", 0), 4),
-                "unique_places": len(job.get("maps_rows", {}))}
+                "unique_places": len(job.get("maps_rows") or {}) or (done[-1]["unique_places"] if done else 0),
+                "re_searches": sum(r.get("deep_next", 0) for r in done)}
     return job.get("maps_state", {}).get("stats")
 
 
@@ -949,6 +951,7 @@ def _collect_stats(job):
     if "reviews_state" in job:
         st["reviews"] = dict(job["reviews_state"]["stats"])
         st["reviews"]["cost_total"] = round(job.get("reviews_cost_prev", 0) + st["reviews"].get("cost", 0), 5)
+        st["reviews"]["tasks_total"] = job.get("reviews_tasks_prev", 0) + st["reviews"].get("tasks", 0)
         st["reviews"]["kept_total"] = job.get("reviews_kept_prev", 0) + st["reviews"].get("kept", 0)
     return st
 
