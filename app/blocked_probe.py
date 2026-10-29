@@ -64,6 +64,18 @@ async def main():
         ok = [r for r in plain if not r.get("error")]
         print(f"normal crawler now: {len(ok)}/{len(plain)} loaded, {sum(1 for r in plain if r['emails'])} with an email "
               f"({time.time() - t:.0f}s); still failing: {dict(collections.Counter(r['error'] for r in plain if r.get('error')).most_common(6))}")
+        # where do the failing sites live? many on one network = that host is refusing our IP
+        res = server.SharedResolver()
+        blocks, ips = collections.Counter(), {}
+        for st in sites:
+            b = await res.block_of(st["url"])
+            blocks[b or "no IPv4 address"] += 1
+            ips[st["url"]] = b
+        await res.close()
+        print("failing sites by network (/24):", dict(blocks.most_common(8)))
+        print("open a few of these in your own browser; if they load there, the VPS's IP is being refused:")
+        for st in sites[:8]:
+            print("   ", st["url"], "->", ips[st["url"]])
     t = time.time()
     res = await server.crawl_many(sites, job["params"].get("max_pages", 10), concurrency=server.BLOCKED_CONCURRENCY,
                                   page_timeout=server.RETRY_TIMEOUT, browser=True)
