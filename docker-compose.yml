@@ -22,6 +22,7 @@ services:
       # optional proxy for that retry (sites that refuse the VPS's IP): PROXY_URL=http://user:pass@host:port in .env
       - PROXY_URL=${PROXY_URL:-}
       - PROXY_COST_PER_GB=${PROXY_COST_PER_GB:-1.0}
+      - PROXY_MAX_PAGES=${PROXY_MAX_PAGES:-5}
     volumes:
       # saved job progress, so a paused or restarted job picks up where it left off
       - ./data:/data
