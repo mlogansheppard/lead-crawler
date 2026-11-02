@@ -77,11 +77,16 @@ async def main():
         for st in sites[:8]:
             print("   ", st["url"], "->", ips[st["url"]])
     t = time.time()
-    res = await server.crawl_many(sites, job["params"].get("max_pages", 10), concurrency=server.BLOCKED_CONCURRENCY,
-                                  page_timeout=server.RETRY_TIMEOUT, browser=True)
+    meter = {}
+    res = await server.crawl_many(sites, min(job["params"].get("max_pages", 10), server.PROXY_MAX_PAGES) if server.PROXY_URL
+                                  else job["params"].get("max_pages", 10), concurrency=server.BLOCKED_CONCURRENCY,
+                                  page_timeout=server.RETRY_TIMEOUT, browser=True, proxy=server.PROXY_URL, meter=meter)
+    if server.PROXY_URL:
+        mb = meter.get("bytes", 0) * 1.1 / 1e6
+        print(f"(through the proxy: about {mb:.1f} MB for {len(sites)} sites, ~${mb / 1000 * server.PROXY_COST_PER_GB:.3f})")
     loaded = [r for r in res if not r.get("error")]
     got = [r for r in res if r["emails"]]
-    print(f"as Chrome: {len(loaded)}/{len(res)} loaded, {len(got)} with an email ({time.time() - t:.0f}s)")
+    print(f"as Chrome{' via proxy' if server.PROXY_URL else ''}: {len(loaded)}/{len(res)} loaded, {len(got)} with an email ({time.time() - t:.0f}s)")
     print("still refused:", dict(collections.Counter(f"{r['error']}@{r.get('blocker') or '?'}" for r in res if r.get("error")).most_common(10)))
     for r in got[:10]:
         print("  ", r["url"], "->", ", ".join(r["emails"][:2]))
