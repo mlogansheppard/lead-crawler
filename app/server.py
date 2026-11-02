@@ -795,6 +795,10 @@ def _health_warnings(job):
         out.append(f"{rate_limited / sites:.1%} of sites rate-limited us (429s, normal is under 2%)")
     if net / sites > RETRY_MIN_SHARE:
         out.append(f"{net / sites:.0%} of sites failed on the network (normal is ~11%)")
+    retried, unlocked = est.get("blocked_retrying") or 0, est.get("blocked_unlocked") or 0
+    if job["stats"].get("proxy") and retried >= 200 and unlocked / retried < 0.15:
+        # through the proxy ~80% of these load; almost none loading means the proxy itself is failing
+        out.append(f"proxy retry unlocked only {unlocked} of {retried} sites - check the proxy balance/login")
     speed = est.get("sites_per_min") or 0
     if sites > 2000 and 0 < speed < 150:
         out.append(f"crawl ran at {speed:.0f} sites/min (normal is 250-550)")

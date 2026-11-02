@@ -996,3 +996,12 @@ def test_with_proxy_refused_sites_are_retried_without_waiting(monkeypatch, tmp_p
     assert _t.time() - t0 < 5  # no hour-long rest through a proxy
     assert seen == {"ids": ["cf.com", "refused.com"], "proxy": "http://proxy.example:8000", "max_pages": 5}
     assert job["stats"]["proxy"]["mb"] == 2.2 and job["stats"]["proxy"]["cost"] == 0.0022
+
+
+def test_warning_when_proxy_stops_working():
+    job = {"stats": {"proxy": {"mb": 3.0, "cost": 0.003},
+                     "emails": {"unique_sites": 10000, "with_email_so_far": 5000, "sites_per_min": 400,
+                                "errors_first_pass": {}, "blocked_retrying": 3000, "blocked_unlocked": 40}}}
+    assert any("proxy" in w for w in server._health_warnings(job))
+    job["stats"]["emails"]["blocked_unlocked"] = 2100
+    assert not any("proxy" in w for w in server._health_warnings(job))
