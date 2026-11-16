@@ -23,6 +23,9 @@ services:
       - PROXY_URL=${PROXY_URL:-}
       - PROXY_COST_PER_GB=${PROXY_COST_PER_GB:-1.0}
       - PROXY_MAX_PAGES=${PROXY_MAX_PAGES:-5}
+      # optional, only for the sheet's service-status cells (balances): Evomi dashboard API key, MillionVerifier API key
+      - EVOMI_API_KEY=${EVOMI_API_KEY:-}
+      - MV_API_KEY=${MV_API_KEY:-}
     volumes:
       # saved job progress, so a paused or restarted job picks up where it left off
       - ./data:/data

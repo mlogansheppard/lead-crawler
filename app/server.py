@@ -1405,6 +1405,91 @@ async def health(_):
                               "dfs_configured": bool(maps.DFS_LOGIN)})
 
 
+EVOMI_API_KEY = os.environ.get("EVOMI_API_KEY", "").strip()
+MV_API_KEY = os.environ.get("MV_API_KEY", "").strip()
+
+
+def _cgroup_mem():
+    try:
+        cur = int(open("/sys/fs/cgroup/memory.current").read())
+        mx = open("/sys/fs/cgroup/memory.max").read().strip()
+        return cur, (int(mx) if mx.isdigit() else 0)
+    except Exception:
+        return 0, 0
+
+
+async def _get_json(session, url, **kw):
+    """(http status, json or None, error text)"""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), **kw) as r:
+            try:
+                body = await r.json(content_type=None)
+            except Exception:
+                body = None
+            return r.status, body, ""
+    except Exception as e:
+        return 0, None, f"{type(e).__name__}: {e}"[:200]
+
+
+async def services_status(request):
+    """Everything the sheet's service-status cells need, in one call (n8n polls this every 10 min)."""
+    if not authed(request):
+        return deny()
+    out = {}
+    du = shutil.disk_usage(DATA_DIR)
+    cur, mx = _cgroup_mem()
+    jobs = [j for j in JOBS.values() if j["kind"] == "maps"]
+    done = sorted((j for j in jobs if j["status"] == "done"), key=lambda j: j.get("finished_at") or 0)
+    last = done[-1] if done else None
+    out["server"] = {"disk_used_pct": round(du.used / du.total * 100, 1), "disk_free_gb": round(du.free / 1e9, 1),
+                     "mem_used_pct": round(cur / mx * 100, 1) if mx else None,
+                     "running": len(RUNNING), "queued": sum(1 for j in jobs if j["status"] == "queued"),
+                     "paused": [{"id": j["id"], "reason": j.get("pause_reason", "")[:200]} for j in jobs if j["status"] == "paused"],
+                     "errors_24h": [{"id": j["id"], "error": j.get("error", "")[:200]} for j in jobs
+                                    if j["status"] == "error" and time.time() - j["created_at"] < 86400],
+                     "last_done_at": last.get("finished_at") if last else None}
+    async with aiohttp.ClientSession() as s:
+        st, body, err = await _get_json(s, "https://api.dataforseo.com/v3/appendix/user_data", headers=maps._auth_header())
+        dfs = {"http": st, "error": err}
+        try:
+            dfs["code"] = body["status_code"]
+            dfs["message"] = body.get("status_message", "")
+            res = body["tasks"][0]["result"][0]
+            dfs["balance"] = res["money"]["balance"]
+        except Exception:
+            pass
+        out["dataforseo"] = dfs
+        if MV_API_KEY:
+            st, body, err = await _get_json(s, "https://api.millionverifier.com/api/v3/credits", params={"api": MV_API_KEY})
+            out["millionverifier"] = {"http": st, "error": err or (body or {}).get("error", ""),
+                                      "credits": (body or {}).get("credits")}
+        if PROXY_URL and EVOMI_API_KEY:
+            st, body, err = await _get_json(s, "https://api.evomi.com/public", headers={"x-apikey": EVOMI_API_KEY})
+            try:
+                bal = body["products"]["rpc"]["balance_mb"]
+            except Exception:
+                bal = None
+            out["proxy_balance"] = {"http": st, "error": err, "balance_mb": bal}
+    if PROXY_URL:
+        px = {"configured": True}
+        try:
+            from curl_cffi.requests import AsyncSession
+            async with AsyncSession(proxy=PROXY_URL, timeout=25) as cs:
+                r = await cs.get("https://ip.evomi.com/s")
+                px["http"] = r.status_code
+                px["ip"] = r.text.strip()[:60] if r.status_code == 200 else ""
+        except Exception as e:
+            px["http"] = 0
+            px["error"] = str(e)[:200]
+        if last:
+            px["last_run"] = {"proxy": (last.get("stats") or {}).get("proxy"),
+                              "warnings": [w for w in (last.get("stats") or {}).get("warnings", []) if "proxy" in w]}
+        out["proxy"] = px
+    else:
+        out["proxy"] = {"configured": False}
+    return web.json_response(out)
+
+
 async def background(app):
     """On startup: reload saved jobs and continue any that were running or paused.
     Then every RESUME_EVERY seconds retry paused jobs (e.g. after a DataForSEO top-up) and clean up old ones."""
@@ -1452,6 +1537,7 @@ def make_app():
     app.router.add_get("/jobs/{job_id}/export/files/{fn}", export_file)
     app.router.add_get("/locations", locations)
     app.router.add_get("/health", health)
+    app.router.add_get("/services", services_status)
     app.cleanup_ctx.append(background)
     return app
 
