@@ -50,6 +50,7 @@ from extract import (FREE_PROVIDERS, GUESSED_PATHS, contact_links, extract_email
 import mxcheck
 import maps
 import export as exporter
+import reviewcheck
 
 API_KEY = os.environ.get("API_KEY", "")
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "80"))
@@ -452,7 +453,7 @@ def save_job(job, force=False):
 # read back when a file is downloaded or a re-crawl starts. (Holding every finished job's full data in memory
 # is what pushed the crawler past its memory limit on the first full-state run.)
 HEAVY = ("rows", "reviews", "results", "crawl_results", "maps_rows", "plan", "node_counts", "searched_kw",
-         "deep_done", "frontier", "deep_round")
+         "deep_done", "frontier", "deep_round", "rc_results")
 
 
 def lighten(job):
@@ -700,7 +701,7 @@ async def run_maps_job(job):
     _assign_emails(job, rows)
     job["rows"] = rows
     job["maps_rows"] = {}
-    for k in ("plan", "node_counts", "searched_kw", "deep_done", "frontier", "deep_round"):
+    for k in ("plan", "node_counts", "searched_kw", "deep_done", "frontier", "deep_round", "rc_results"):
         job.pop(k, None)  # only needed while the Maps searches run
 
     # 3) DataForSEO reviews, lowest rating first, only for businesses we can email
@@ -979,7 +980,7 @@ async def guard(job, runner):
         job["error"] = f"{type(e).__name__}: {e}"
         traceback.print_exc()
     job["active_s"] = job.get("active_s", 0) + (time.time() - started)
-    if job["kind"] == "maps":
+    if job["kind"] in ("maps", "reviewcheck"):
         save_job(job, force=True)
 
 
@@ -1002,12 +1003,12 @@ def start(job):
             save_job(job, force=True)
         return
     RUNNING.add(job["id"])
-    runner = run_maps_job if job["kind"] == "maps" else run_email_job
+    runner = {"maps": run_maps_job, "reviewcheck": run_review_check_job}.get(job["kind"], run_email_job)
 
     async def go():
         try:
             await guard(job, runner)
-            if job["kind"] == "maps":
+            if job["kind"] in ("maps", "reviewcheck"):
                 lighten(job)
                 _trim_memory()
         finally:
@@ -1364,6 +1365,86 @@ async def export_file(request):
     return web.Response(body=body, content_type="text/csv", charset="utf-8")
 
 
+# ---------------------------------------------------------------- review check (reply export -> xlsx tabs)
+RC_XLSX = "review-check.xlsx"
+
+
+async def run_review_check_job(job):
+    p = job["params"]
+    d = _export_dir(job["id"])
+    loop = asyncio.get_running_loop()
+
+    def load():
+        with open(os.path.join(d, "input.csv"), "rb") as f:
+            header, body = reviewcheck.parse_csv(f.read())
+        rows, st = reviewcheck.select(header, body, p["test_limit"])
+        tasks, keys, hows = reviewcheck.plan(header, rows, p["depth"], p.get("sort_by", "lowest_rating"))
+        return header, rows, st, tasks, keys, hows
+    job["phase"] = "reading file"
+    header, rows, st, tasks, keys, hows = await loop.run_in_executor(SCAN_POOL, load)
+    if not header:
+        raise ValueError("the uploaded file is empty or not a CSV")
+    job["stats"].update(st)
+    job["stats"]["businesses"] = len(tasks)
+    job["stats"]["no_identifier"] = sum(1 for k in keys if not k)
+    if "reviews_state" not in job:
+        job["reviews_state"] = maps.new_stage(tasks)
+        job["rc_results"] = {}
+    job["phase"] = "reviews"
+
+    def save(force=False):
+        save_job(job, force)
+    save(True)
+    results = job["rc_results"]
+
+    def on_ready(key, t):
+        results[key] = reviewcheck.summarize(t, p["max_stars"], p["days"])
+    async with maps.session() as s:
+        await maps.run_stage(s, f"{maps.DFS_REVIEWS_BASE}/task_post", maps.DFS_REVIEWS_BASE + "/task_get/{}",
+                             job["reviews_state"], on_ready, save)
+    job["phase"] = "building file"
+
+    def build():
+        tabs = reviewcheck.split(header, rows, keys, hows, results, p["days"])
+        reviewcheck.to_xlsx(header, tabs, os.path.join(d, RC_XLSX))
+        return {k: len(v) for k, v in tabs.items()}
+    job["stats"]["tabs"] = await loop.run_in_executor(SCAN_POOL, build)
+    job["stats"]["cost"] = job["reviews_state"]["stats"]["cost"]
+
+
+async def create_review_check_job(request):
+    """POST raw CSV bytes. Query: test_limit (0 = all), days (30), max_stars (2), depth (10), sort_by, label."""
+    if not authed(request):
+        return deny()
+    raw = await request.read()
+    if not raw:
+        return web.json_response({"error": "empty upload"}, status=400)
+    q = request.query
+    params = {"test_limit": max(0, int(q.get("test_limit", 100) or 0)),
+              "days": max(1, min(int(q.get("days", 30)), 3650)),
+              "max_stars": float(q.get("max_stars", 2)),
+              "depth": max(10, min(int(q.get("depth", 10)), 200)),
+              "sort_by": q.get("sort_by", "lowest_rating") if q.get("sort_by") in ("lowest_rating", "newest") else "lowest_rating"}
+    job_id, job = new_job("reviewcheck", label=str(q.get("label", ""))[:200], params=params)
+    os.makedirs(_export_dir(job_id), exist_ok=True)
+    with open(os.path.join(_export_dir(job_id), "input.csv"), "wb") as f:
+        f.write(raw)
+    save_job(job, force=True)
+    start(job)
+    return web.json_response({"job_id": job_id, "params": params})
+
+
+async def review_check_file(request):
+    if not authed(request):
+        return deny()
+    path = os.path.join(_export_dir(request.match_info["job_id"]), RC_XLSX)
+    if not os.path.exists(path):
+        return web.json_response({"error": "not ready"}, status=404)
+    with open(path, "rb") as fh:
+        body = fh.read()
+    return web.Response(body=body, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 STATE_NAMES = {
     "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA", "Colorado": "CO",
     "Connecticut": "CT", "Delaware": "DE", "District of Columbia": "DC", "Florida": "FL", "Georgia": "GA",
@@ -1496,7 +1577,7 @@ async def background(app):
     asyncio.get_running_loop().set_default_executor(DNS_POOL)
     load_jobs()
     for j in sorted(JOBS.values(), key=lambda j: j["created_at"]):
-        if j["kind"] == "maps" and j["status"] in ("running", "paused", "queued"):
+        if j["kind"] in ("maps", "reviewcheck") and j["status"] in ("running", "paused", "queued"):
             if j["status"] == "running":
                 j["status"] = "queued"  # interrupted by a restart: re-queue, keeping its saved progress
             start(j)
@@ -1522,7 +1603,7 @@ async def background(app):
 
 
 def make_app():
-    app = web.Application(client_max_size=50 * 1024 * 1024)
+    app = web.Application(client_max_size=400 * 1024 * 1024)
     app.router.add_post("/maps-jobs", create_maps_job)
     app.router.add_post("/jobs", create_email_job)
     app.router.add_get("/jobs/{job_id}", job_status)
@@ -1538,6 +1619,8 @@ def make_app():
     app.router.add_get("/locations", locations)
     app.router.add_get("/health", health)
     app.router.add_get("/services", services_status)
+    app.router.add_post("/review-check-jobs", create_review_check_job)
+    app.router.add_get("/jobs/{job_id}/review-check.xlsx", review_check_file)
     app.cleanup_ctx.append(background)
     return app
 
