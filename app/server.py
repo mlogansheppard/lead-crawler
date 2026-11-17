@@ -173,6 +173,17 @@ def _err_kind(e):
     return "other"
 
 
+def _wire_bytes(r):
+    """Bytes that actually crossed the network (and the proxy) for one response: compressed body + headers
+    + the request. Counting the decoded body instead overstated proxy use ~3x (pages arrive gzip/brotli'd)."""
+    try:
+        from curl_cffi.const import CurlInfo
+        c = r.curl
+        return int(c.getinfo(CurlInfo.SIZE_DOWNLOAD_T)) + int(c.getinfo(CurlInfo.HEADER_SIZE)) + int(c.getinfo(CurlInfo.REQUEST_SIZE))
+    except Exception:
+        return 600
+
+
 class BrowserSession:
     """Fetches the way real Chrome does (TLS and HTTP/2 fingerprint plus headers), for sites that refuse
     ordinary clients. Only used for the blocked-sites pass, so most crawling stays on fast aiohttp."""
@@ -187,19 +198,20 @@ class BrowserSession:
     async def fetch_ex(self, url):
         try:
             async with self.s.stream("GET", url) as r:
-                self.bytes += 600  # request + response headers, roughly
-                if r.status_code >= 400:
-                    b = _blocker(r.headers)
-                    return None, str(r.url), f"http_{r.status_code}" + (f"@{b}" if b else "")
-                ctype = r.headers.get("content-type", "") or ""
-                if ctype and not any(t in ctype for t in ("html", "text", "xml")):
-                    return None, str(r.url), "not_html"
-                buf = bytearray()
-                async for chunk in r.aiter_content():
-                    buf += chunk
-                    self.bytes += len(chunk)
-                    if len(buf) >= MAX_BYTES:
-                        break
+                try:
+                    if r.status_code >= 400:
+                        b = _blocker(r.headers)
+                        return None, str(r.url), f"http_{r.status_code}" + (f"@{b}" if b else "")
+                    ctype = r.headers.get("content-type", "") or ""
+                    if ctype and not any(t in ctype for t in ("html", "text", "xml")):
+                        return None, str(r.url), "not_html"
+                    buf = bytearray()
+                    async for chunk in r.aiter_content():
+                        buf += chunk
+                        if len(buf) >= MAX_BYTES:
+                            break
+                finally:
+                    self.bytes += _wire_bytes(r)
                 m = re.search(r"charset=([\w-]+)", ctype)
                 enc = m.group(1) if m else "utf-8"
                 try:
@@ -764,6 +776,7 @@ async def _blocked_pass(job, rows, save):
         save()
     sites = [{"id": k, **by_site[k]} for k in blocked]
     meter = {}
+    bal_before = await _evomi_balance_mb() if PROXY_URL else None
     await crawl_many(sites, min(p["max_pages"], PROXY_MAX_PAGES) if PROXY_URL else p["max_pages"], tick,
                      concurrency=BLOCKED_CONCURRENCY, page_timeout=RETRY_TIMEOUT, browser=True, proxy=PROXY_URL, meter=meter)
     if PROXY_URL:
@@ -771,6 +784,11 @@ async def _blocked_pass(job, rows, save):
         px = job["stats"].setdefault("proxy", {"mb": 0, "cost": 0})
         px["mb"] = round(px["mb"] + mb, 1)
         px["cost"] = round(px["mb"] / 1000 * PROXY_COST_PER_GB, 4)
+        bal_after = await _evomi_balance_mb()
+        if bal_before is not None and bal_after is not None:
+            # Evomi's own count, for checking the estimate (overlapping runs both see the other's use, and
+            # Evomi's balance can lag a few minutes, so the estimate above stays the cost of record)
+            px["evomi_balance_drop_mb"] = round(px.get("evomi_balance_drop_mb", 0) + bal_before - bal_after, 1)
     est["blocked_unlocked"] = sum(1 for v in done.values() if not v.get("error")) - loaded_before
     job["email_filter"] = await clean_job_emails(done)
     est["recovered_from_blocked"] = sum(1 for v in done.values() if v["emails"]) - before
@@ -1488,6 +1506,17 @@ async def health(_):
 
 EVOMI_API_KEY = os.environ.get("EVOMI_API_KEY", "").strip()
 MV_API_KEY = os.environ.get("MV_API_KEY", "").strip()
+
+
+async def _evomi_balance_mb():
+    if not EVOMI_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as s:
+            st, body, _ = await _get_json(s, "https://api.evomi.com/public", headers={"x-apikey": EVOMI_API_KEY})
+        return float(body["products"]["rpc"]["balance_mb"])
+    except Exception:
+        return None
 
 
 def _cgroup_mem():
